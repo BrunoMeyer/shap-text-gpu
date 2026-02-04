@@ -103,7 +103,7 @@ static Dataset load_dataset(const std::string& path) {
 
 __global__ void mlp_forward_kernel(
     const int32_t* token_ids,
-    int n,
+    int n_permutations,
     int seq_len,
     float inv_vocab_size,
     const float* W_all,
@@ -117,56 +117,74 @@ __global__ void mlp_forward_kernel(
     int out_dim_last,
     int max_dim
 ) {
-    int sample = blockIdx.x;
-    int tid = threadIdx.x;
-    if (sample >= n) return;
-    bool do_write = (tid < out_dim_last);
+    int sample = blockIdx.x; // sample index
+    int tx = threadIdx.x;    // thread index
+    int stride = blockDim.x;
+    bool do_write = (tx < out_dim_last);
 
-    // Naive forward for one output neuron of final layer.
-    // We compute full hidden vectors in local memory (very slow but simple).
-    extern __shared__ float scratch[];
+    // Use dynamically-allocated shared memory (bytes) so we can mix float and int storage.
+    extern __shared__ char s[];
 
-    // scratch layout: max_dim * 2 (ping/pong)
-    float* buf0 = scratch;
-    float* buf1 = scratch + max_dim;
+    // Layout in shared memory (bytes): 2 * max_dim floats, then seq_len ints for permutation.
+    float* buf0 = reinterpret_cast<float*>(s);
+    float* buf1 = reinterpret_cast<float*>(s + (size_t)max_dim * sizeof(float));
+    int* perm = reinterpret_cast<int*>(s + (size_t)max_dim * 2 * sizeof(float));
 
-    // Load input features (token_id / vocab_size)
-    for (int j = tid; j < seq_len; j += blockDim.x) {
-        int32_t tid = token_ids[sample * seq_len + j];
-        buf0[j] = (float)tid * inv_vocab_size;
-    }
-    __syncthreads();
-
-    // Forward through layers; for simplicity we only support first layer in_dim == seq_len.
-    // Each layer output is computed by all threads cooperatively.
-    float* in_buf = buf0;
-    float* out_buf = buf1;
-
-    for (int l = 0; l < num_layers; l++) {
-        int in_dim = in_dims[l];
-        int out_dim = out_dims[l];
-        const float* W = W_all + w_offsets[l];
-        const float* b = b_all + b_offsets[l];
-
-        // Each thread computes multiple output neurons.
-        for (int o = tid; o < out_dim; o += blockDim.x) {
-            float acc = b[o];
-            const float* wrow = W + (size_t)o * (size_t)in_dim;
-            for (int k = 0; k < in_dim; k++) {
-                acc += wrow[k] * in_buf[k];
+    for (int permutation = 0; permutation < n_permutations; permutation++) {
+        // Build a random permutation of [0, seq_len) on one thread (Fisher-Yates with LCG RNG),
+        // then sync so all threads can use it.
+        if (tx == 0) {
+            for (int j = 0; j < seq_len; ++j) perm[j] = j;
+            // Simple LCG seed depending on sample and permutation (deterministic per-launch)
+            unsigned int state = (unsigned int)sample * 1664525u + (unsigned int)permutation * 1013904223u + 12345u;
+            for (int j = seq_len - 1; j > 0; --j) {
+                state = state * 1103515245u + 12345u;
+                unsigned int r = state % (unsigned int)(j + 1);
+                int tmp = perm[j]; perm[j] = perm[r]; perm[r] = tmp;
             }
-            out_buf[o] = acc; // identity activation
         }
         __syncthreads();
 
-        // swap buffers
-        in_buf = out_buf;
-        out_buf = (out_buf == buf0) ? buf1 : buf0;
-    }
+        // Load input features (token_id / vocab_size) using the permutation.
+        for (int j = tx; j < seq_len; j += stride) {
+            int idx = perm[j];
+            int32_t tok = token_ids[(size_t)sample * (size_t)seq_len + (size_t)idx];
+            buf0[j] = (float)tok * inv_vocab_size;
+        }
+        __syncthreads();
 
-    // After final layer, in_buf holds logits
-    if (do_write) {
-        logits_out[sample * out_dim_last + tid] = in_buf[tid];
+        // Forward through layers; for simplicity we only support first layer in_dim == seq_len.
+        float* in_buf = buf0;
+        float* out_buf = buf1;
+
+        for (int l = 0; l < num_layers; l++) {
+            int in_dim = in_dims[l];
+            int out_dim = out_dims[l];
+            const float* W = W_all + w_offsets[l];
+            const float* b = b_all + b_offsets[l];
+
+            // Each thread computes multiple output neurons.
+            for (int o = tx; o < out_dim; o += stride) {
+                float acc = b[o];
+                const float* wrow = W + (size_t)o * (size_t)in_dim;
+                for (int k = 0; k < in_dim; k++) {
+                    acc += wrow[k] * in_buf[k];
+                }
+                out_buf[o] = acc; // identity activation
+            }
+            __syncthreads();
+
+            // swap buffers
+            float* tmp = in_buf;
+            in_buf = out_buf;
+            out_buf = tmp;
+        }
+
+        // After final layer, in_buf holds logits
+        if (do_write) {
+            logits_out[(size_t)sample * (size_t)out_dim_last + (size_t)tx] = in_buf[tx];
+        }
+        __syncthreads();
     }
 }
 
@@ -289,7 +307,8 @@ int main(int argc, char** argv) {
             if (layer.out_dim > max_dim) max_dim = layer.out_dim;
             if (layer.in_dim > max_dim) max_dim = layer.in_dim;
         }
-        size_t shmem = (size_t)max_dim * 2 * sizeof(float);
+        // Shared memory: 2 * max_dim floats + seq_len ints for permutation buffer
+        size_t shmem = (size_t)max_dim * 2 * sizeof(float) + (size_t)ds.seq_len * sizeof(int);
 
         dim3 grid(ds.n);
         dim3 block(threads);
