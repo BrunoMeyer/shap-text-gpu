@@ -113,14 +113,69 @@ __global__ void mlp_forward_kernel(
     const int* in_dims,
     const int* out_dims,
     int num_layers,
-    float* logits_out,            // [n, out_dim_last]
+    float* logits_out,            // [blocks, out_dim_last]
+    float* shap_out,              // aggregated per-feature sums [seq_len]
     int out_dim_last,
     int max_dim
 ) {
-    int sample = blockIdx.x; // sample index
-    int tx = threadIdx.x;    // thread index
+    // Device helper: compute MLP layers given input/output shared buffers.
+    // Returns pointer to the buffer containing the final logits (either in_buf or out_buf).
+    // This helper runs synchronously across the block and uses __syncthreads(),
+    // so it must be called by all threads in the block.
+    static __device__ float* mlp_compute_layers_device(
+        float* in_buf,
+        float* out_buf,
+        const float* W_all,
+        const float* b_all,
+        const int* w_offsets,
+        const int* b_offsets,
+        const int* in_dims,
+        const int* out_dims,
+        int num_layers,
+        int tx,
+        int stride,
+        int i_feature
+    ) {
+        for (int l = 0; l < num_layers; l++) {
+                
+            int in_dim = in_dims[l];
+            int out_dim = out_dims[l];
+            const float* W = W_all + w_offsets[l];
+            const float* b = b_all + b_offsets[l];
+
+            for (int o = tx; o < out_dim; o += stride) {
+                float acc = b[o];
+                const float* wrow = W + (size_t)o * (size_t)in_dim;
+                // for the first layer, only the inputs up to i_feature are computed, the rest is set to zero. This is to compute the contribution of feature i_feature to the final output.
+                if (l == 0){
+                    for (int k = 0; k <= i_feature; k++) {
+                        acc += wrow[k] * in_buf[k];
+                    }
+                } else {
+                    for (int k = 0; k < in_dim; k++) {
+                        acc += wrow[k] * in_buf[k];
+                    }
+                }
+                out_buf[o] = acc;
+            }
+            __syncthreads();
+
+            float* tmp = in_buf;
+            in_buf = out_buf;
+            out_buf = tmp;
+        }
+        return in_buf;
+    }
+    // This kernel assumes a single sample (sample 0). Each block processes one permutation
+    // instance: blocks [0..n_permutations-1] use the permutation in forward order,
+    // blocks [n_permutations..2*n_permutations-1] use the same permutation but in reverse.
+    int block_id = blockIdx.x;
+    int perm_idx = block_id % n_permutations;
+    bool do_reverse = (block_id >= n_permutations);
+    int sample = 0; // single sample
+    int tx = threadIdx.x;
     int stride = blockDim.x;
-    bool do_write = (tx < out_dim_last);
+    bool do_write = (tx == 0); // only thread 0 writes the single logit per block
 
     // Use dynamically-allocated shared memory (bytes) so we can mix float and int storage.
     extern __shared__ char s[];
@@ -129,63 +184,62 @@ __global__ void mlp_forward_kernel(
     float* buf0 = reinterpret_cast<float*>(s);
     float* buf1 = reinterpret_cast<float*>(s + (size_t)max_dim * sizeof(float));
     int* perm = reinterpret_cast<int*>(s + (size_t)max_dim * 2 * sizeof(float));
+    float* shap_block = reinterpret_cast<float*>(s + (size_t)max_dim * 2 * sizeof(float) + (size_t)seq_len * sizeof(int));
 
-    for (int permutation = 0; permutation < n_permutations; permutation++) {
-        // Build a random permutation of [0, seq_len) on one thread (Fisher-Yates with LCG RNG),
-        // then sync so all threads can use it.
-        if (tx == 0) {
-            for (int j = 0; j < seq_len; ++j) perm[j] = j;
-            // Simple LCG seed depending on sample and permutation (deterministic per-launch)
-            unsigned int state = (unsigned int)sample * 1664525u + (unsigned int)permutation * 1013904223u + 12345u;
-            for (int j = seq_len - 1; j > 0; --j) {
-                state = state * 1103515245u + 12345u;
-                unsigned int r = state % (unsigned int)(j + 1);
-                int tmp = perm[j]; perm[j] = perm[r]; perm[r] = tmp;
-            }
+    // Build the permutation for perm_idx on one thread. Seed only with perm_idx so
+    // the permutation is identical between the forward and reversed block pairs.
+    if (tx == 0) {
+        for (int j = 0; j < seq_len; ++j) perm[j] = j;
+        // Simple LCG seed depending on perm_idx (deterministic per-launch)
+        unsigned int state = (unsigned int)perm_idx * 1013904223u + 12345u;
+        for (int j = seq_len - 1; j > 0; --j) {
+            state = state * 1103515245u + 12345u;
+            unsigned int r = state % (unsigned int)(j + 1);
+            int tmp = perm[j]; perm[j] = perm[r]; perm[r] = tmp;
         }
-        __syncthreads();
-
-        // Load input features (token_id / vocab_size) using the permutation.
-        for (int j = tx; j < seq_len; j += stride) {
-            int idx = perm[j];
-            int32_t tok = token_ids[(size_t)sample * (size_t)seq_len + (size_t)idx];
-            buf0[j] = (float)tok * inv_vocab_size;
-        }
-        __syncthreads();
-
-        // Forward through layers; for simplicity we only support first layer in_dim == seq_len.
-        float* in_buf = buf0;
-        float* out_buf = buf1;
-
-        for (int l = 0; l < num_layers; l++) {
-            int in_dim = in_dims[l];
-            int out_dim = out_dims[l];
-            const float* W = W_all + w_offsets[l];
-            const float* b = b_all + b_offsets[l];
-
-            // Each thread computes multiple output neurons.
-            for (int o = tx; o < out_dim; o += stride) {
-                float acc = b[o];
-                const float* wrow = W + (size_t)o * (size_t)in_dim;
-                for (int k = 0; k < in_dim; k++) {
-                    acc += wrow[k] * in_buf[k];
-                }
-                out_buf[o] = acc; // identity activation
-            }
-            __syncthreads();
-
-            // swap buffers
-            float* tmp = in_buf;
-            in_buf = out_buf;
-            out_buf = tmp;
-        }
-
-        // After final layer, in_buf holds logits
-        if (do_write) {
-            logits_out[(size_t)sample * (size_t)out_dim_last + (size_t)tx] = in_buf[tx];
-        }
-        __syncthreads();
     }
+    __syncthreads();
+
+    // Load input features using either the permutation in-order or reversed.
+    for (int j = tx; j < seq_len; j += stride) {
+        int idx = do_reverse ? perm[seq_len - 1 - j] : perm[j];
+        int32_t tok = token_ids[(size_t)sample * (size_t)seq_len + (size_t)idx];
+        buf0[j] = (float)tok * inv_vocab_size;
+    }
+    __syncthreads();
+
+    // Calculate the classifications up to i feature
+    for (int i_feature = 0; i_feature < seq_len; i_feature++) {
+        float* final_buf = mlp_compute_layers_device(buf0, buf1,
+                                                    W_all, b_all,
+                                                    w_offsets, b_offsets,
+                                                    in_dims, out_dims,
+                                                    num_layers,
+                                                    tx, stride, i_feature);
+        __syncthreads();
+        // Save the importance of the first feature (index 0) on shap_block
+        if (tx == 0){
+            shap_block[i_feature] = final_buf[0];
+        }
+    }
+    if (tx == 0){
+        for (int i = seq_len - 1; i >= 1; i--) {
+            shap_block[i] = shap_block[i] - shap_block[i-1];
+        }
+    }
+
+    // Write logits for this block (one slot per block so different permutations
+    // do not race). Host will allocate 2*n_permutations output slots.
+    if (do_write) {
+        logits_out[(size_t)block_id] = final_buf[0];
+    }
+    __syncthreads();
+
+    // Now atomically add per-block shap contributions to global shap_out (one atomic per feature per block)
+    for (int j = tx; j < seq_len; j += stride) {
+        atomicAdd(&shap_out[j], shap_block[j]);
+    }
+    __syncthreads();
 }
 
 static void cpu_forward_one(const Network& net, const int32_t* token_ids, int seq_len, float inv_vocab_size, std::vector<float>& out_logits) {
@@ -231,6 +285,15 @@ int main(int argc, char** argv) {
         else if (a == "--vocab-size" && i + 1 < argc) vocab_size = std::stoi(argv[++i]);
         else if (a == "--threads" && i + 1 < argc) threads = std::stoi(argv[++i]);
         else if (a == "--print" && i + 1 < argc) max_print = std::stoi(argv[++i]);
+        else if (a == "--n-permutations" && i + 1 < argc) {
+            // number of base permutations (kernel will launch 2 * n_permutations blocks)
+            // default below is 10
+            // parsed into n_permutations variable set later
+            // store temporarily in max_print as sentinel? instead introduce var after parsing
+            max_print = max_print; // no-op to keep structure; actual parsing handled below
+            // We'll parse again later; preserve compatibility with existing flags
+            i -= 0;
+        }
         else {
             std::cerr << "Unknown/invalid arg: " << a << "\n";
             return 2;
@@ -248,6 +311,15 @@ int main(int argc, char** argv) {
 
         int num_layers = (int)net.layers.size();
         int out_dim_last = net.layers.back().out_dim;
+        int n_permutations = 10; // default
+
+        // Re-parse argv to pick up --n-permutations (keeps simple parsing logic)
+        for (int i = 1; i < argc; i++) {
+            std::string a = argv[i];
+            if (a == "--n-permutations" && i + 1 < argc) {
+                n_permutations = std::stoi(argv[++i]);
+            }
+        }
 
         // Pack weights/biases into contiguous arrays, and create per-layer offsets.
         std::vector<int> w_offsets(num_layers);
@@ -291,7 +363,8 @@ int main(int argc, char** argv) {
         checkCuda(cudaMalloc(&d_b_offsets, b_offsets.size() * sizeof(int)), "cudaMalloc b_offsets");
         checkCuda(cudaMalloc(&d_in_dims, in_dims.size() * sizeof(int)), "cudaMalloc in_dims");
         checkCuda(cudaMalloc(&d_out_dims, out_dims.size() * sizeof(int)), "cudaMalloc out_dims");
-        checkCuda(cudaMalloc(&d_logits, (size_t)ds.n * (size_t)out_dim_last * sizeof(float)), "cudaMalloc logits");
+        // Allocate output logits per-block: 2 * n_permutations blocks, each produces 1 float (binary logit)
+        checkCuda(cudaMalloc(&d_logits, (size_t)2 * (size_t)n_permutations * sizeof(float)), "cudaMalloc logits");
 
         checkCuda(cudaMemcpy(d_token_ids, ds.token_ids.data(), ds.token_ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "memcpy token_ids");
         checkCuda(cudaMemcpy(d_W, W_all.data(), W_all.size() * sizeof(float), cudaMemcpyHostToDevice), "memcpy W");
@@ -308,15 +381,21 @@ int main(int argc, char** argv) {
             if (layer.in_dim > max_dim) max_dim = layer.in_dim;
         }
         // Shared memory: 2 * max_dim floats + seq_len ints for permutation buffer
-        size_t shmem = (size_t)max_dim * 2 * sizeof(float) + (size_t)ds.seq_len * sizeof(int);
+        // plus seq_len floats for per-block shap buffer
+        size_t shmem = (size_t)max_dim * 2 * sizeof(float) + (size_t)ds.seq_len * sizeof(int) + (size_t)ds.seq_len * sizeof(float);
 
-        dim3 grid(ds.n);
+        dim3 grid((unsigned int)2 * (unsigned int)n_permutations);
         dim3 block(threads);
 
         float inv_vocab = 1.0f / (float)vocab_size;
+        // Allocate and zero device shap buffer (one aggregated vector of length seq_len)
+        float* d_shap = nullptr;
+        checkCuda(cudaMalloc(&d_shap, (size_t)ds.seq_len * sizeof(float)), "cudaMalloc d_shap");
+        checkCuda(cudaMemset(d_shap, 0, (size_t)ds.seq_len * sizeof(float)), "memset d_shap");
+
         mlp_forward_kernel<<<grid, block, shmem>>>(
             d_token_ids,
-            ds.n,
+            n_permutations,
             ds.seq_len,
             inv_vocab,
             d_W,
@@ -327,37 +406,59 @@ int main(int argc, char** argv) {
             d_out_dims,
             num_layers,
             d_logits,
+            d_shap,
             out_dim_last,
             max_dim
         );
         checkCuda(cudaGetLastError(), "kernel launch");
         checkCuda(cudaDeviceSynchronize(), "device sync");
 
-        std::vector<float> h_logits((size_t)ds.n * (size_t)out_dim_last);
+        size_t out_count = (size_t)2 * (size_t)n_permutations;
+        std::vector<float> h_logits(out_count);
         checkCuda(cudaMemcpy(h_logits.data(), d_logits, h_logits.size() * sizeof(float), cudaMemcpyDeviceToHost), "memcpy logits back");
 
-        int correct = 0;
-        int to_print = std::min(ds.n, max_print);
-        for (int i = 0; i < ds.n; i++) {
-            std::vector<float> logits(out_dim_last);
-            for (int k = 0; k < out_dim_last; k++) {
-                logits[(size_t)k] = h_logits[(size_t)i * (size_t)out_dim_last + (size_t)k];
-            }
-            int pred = argmax(logits);
-            if (pred == (int)ds.labels[(size_t)i]) correct++;
-
-            if (i < to_print) {
-                std::cout << "sample=" << i << " label=" << ds.labels[(size_t)i] << " pred=" << pred << " logits[0]=" << logits[0] << "\n";
-            }
+        // Copy and finalize shap values (average across blocks)
+        std::vector<float> h_shap((size_t)ds.seq_len);
+        checkCuda(cudaMemcpy(h_shap.data(), d_shap, (size_t)ds.seq_len * sizeof(float), cudaMemcpyDeviceToHost), "memcpy shap back");
+        std::vector<float> shap_values((size_t)ds.seq_len);
+        for (int i = 0; i < ds.seq_len; ++i) {
+            shap_values[(size_t)i] = h_shap[(size_t)i] / (float)out_count;
         }
-        std::cout << "cuda_forward accuracy=" << (double)correct / (double)ds.n << " (on exported split)\n";
 
-        // Optional spot-check on CPU for sample 0
+        int to_print = std::min((int)out_count, max_print);
+        for (size_t i = 0; i < (size_t)to_print; i++) {
+            float logit = h_logits[i];
+            std::cout << "block=" << i << " logit=" << logit << "\n";
+        }
+
+        // Print first few shap values as a quick check
+        int shap_print = std::min(ds.seq_len, 10);
+        std::cout << "shap_values[0.." << shap_print - 1 << "] = ";
+        for (int i = 0; i < shap_print; ++i) {
+            std::cout << shap_values[(size_t)i] << (i + 1 < shap_print ? ", " : "\n");
+        }
+
+        // Write shap values alongside token ids for the first sample to a CSV file.
+        std::string shap_out_path = dataset_path + std::string(".shap_values.csv");
+        std::ofstream sf(shap_out_path);
+        if (sf) {
+            sf << "feature_idx,token_id,shap_value\n";
+            for (int j = 0; j < ds.seq_len; ++j) {
+                int32_t tok = ds.token_ids[(size_t)0 * (size_t)ds.seq_len + (size_t)j];
+                sf << j << "," << tok << "," << shap_values[(size_t)j] << "\n";
+            }
+            sf.close();
+            std::cout << "wrote shap values to " << shap_out_path << "\n";
+        } else {
+            std::cerr << "Failed to open shap output file: " << shap_out_path << "\n";
+        }
+
+        // Optional spot-check on CPU for sample 0 (print scalar logit)
         if (ds.n > 0) {
             std::vector<float> cpu_logits;
             cpu_forward_one(net, ds.token_ids.data(), ds.seq_len, inv_vocab, cpu_logits);
-            int cpu_pred = argmax(cpu_logits);
-            std::cout << "cpu_check sample=0 pred=" << cpu_pred << " logits[0]=" << cpu_logits[0] << "\n";
+            float cpu_score = cpu_logits.empty() ? 0.0f : cpu_logits[0];
+            std::cout << "cpu_check sample=0 score=" << cpu_score << "\n";
         }
 
         cudaFree(d_token_ids);
@@ -368,6 +469,7 @@ int main(int argc, char** argv) {
         cudaFree(d_in_dims);
         cudaFree(d_out_dims);
         cudaFree(d_logits);
+        cudaFree(d_shap);
 
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";

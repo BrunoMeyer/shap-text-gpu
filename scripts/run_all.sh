@@ -9,7 +9,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR_DEFAULT="$ROOT_DIR/out"
 
-DATASET="ag_news"
+DATASET="imdb"
 TOKENIZER="bert-base-uncased"
 MAX_LEN=64
 HIDDEN_DIM=128
@@ -61,7 +61,7 @@ Other:
   -h|--help
 
 Example:
-  $0 --dataset ag_news --max-len 64 --hidden-dim 128 --num-layers 3 --epochs 1
+  $0 --dataset imdb --max-len 64 --hidden-dim 128 --num-layers 3 --epochs 1
 EOF
 }
 
@@ -132,9 +132,15 @@ PY
 )"
 
 echo "[3/3] CUDA feedforward"
+# Create a single-sample dataset file (first sample) and pass that to the CUDA binary
+SINGLE_DATASET="$OUT_DIR/${DATASET_FILE}.single"
+seq_len=$(awk 'NR==1{print $2; exit}' "$OUT_DIR/$DATASET_FILE")
+sample_line=$(sed -n '2p' "$OUT_DIR/$DATASET_FILE")
+printf "1 %s\n%s\n" "$seq_len" "$sample_line" > "$SINGLE_DATASET"
+
 "$ROOT_DIR/out/feedforward" \
   --weights "$OUT_DIR/$WEIGHTS_FILE" \
-  --dataset "$OUT_DIR/$DATASET_FILE" \
+  --dataset "$SINGLE_DATASET" \
   --vocab-size "$VOCAB_SIZE" \
   --threads "$THREADS" \
   --print "$PRINT"
