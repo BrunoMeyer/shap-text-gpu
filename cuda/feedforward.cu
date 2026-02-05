@@ -101,6 +101,53 @@ static Dataset load_dataset(const std::string& path) {
     return ds;
 }
 
+// Device helper: compute MLP layers given input/output shared buffers.
+// Returns pointer to the buffer containing the final logits (either in_buf or out_buf).
+// This helper runs synchronously across the block and uses __syncthreads(),
+// so it must be called by all threads in the block.
+__device__ float* mlp_compute_layers_device(
+    float* in_buf,
+    float* out_buf,
+    const float* W_all,
+    const float* b_all,
+    const int* w_offsets,
+    const int* b_offsets,
+    const int* in_dims,
+    const int* out_dims,
+    int num_layers,
+    int tx,
+    int stride,
+    int i_feature
+) {
+    for (int l = 0; l < num_layers; l++) {
+        int in_dim = in_dims[l];
+        int out_dim = out_dims[l];
+        const float* W = W_all + w_offsets[l];
+        const float* b = b_all + b_offsets[l];
+
+        for (int o = tx; o < out_dim; o += stride) {
+            float acc = b[o];
+            const float* wrow = W + (size_t)o * (size_t)in_dim;
+            if (l == 0) {
+                for (int k = 0; k <= i_feature; k++) {
+                    acc += wrow[k] * in_buf[k];
+                }
+            } else {
+                for (int k = 0; k < in_dim; k++) {
+                    acc += wrow[k] * in_buf[k];
+                }
+            }
+            out_buf[o] = acc;
+        }
+        __syncthreads();
+
+        float* tmp = in_buf;
+        in_buf = out_buf;
+        out_buf = tmp;
+    }
+    return in_buf;
+}
+
 __global__ void mlp_forward_kernel(
     const int32_t* token_ids,
     int n_permutations,
@@ -118,54 +165,6 @@ __global__ void mlp_forward_kernel(
     int out_dim_last,
     int max_dim
 ) {
-    // Device helper: compute MLP layers given input/output shared buffers.
-    // Returns pointer to the buffer containing the final logits (either in_buf or out_buf).
-    // This helper runs synchronously across the block and uses __syncthreads(),
-    // so it must be called by all threads in the block.
-    static __device__ float* mlp_compute_layers_device(
-        float* in_buf,
-        float* out_buf,
-        const float* W_all,
-        const float* b_all,
-        const int* w_offsets,
-        const int* b_offsets,
-        const int* in_dims,
-        const int* out_dims,
-        int num_layers,
-        int tx,
-        int stride,
-        int i_feature
-    ) {
-        for (int l = 0; l < num_layers; l++) {
-                
-            int in_dim = in_dims[l];
-            int out_dim = out_dims[l];
-            const float* W = W_all + w_offsets[l];
-            const float* b = b_all + b_offsets[l];
-
-            for (int o = tx; o < out_dim; o += stride) {
-                float acc = b[o];
-                const float* wrow = W + (size_t)o * (size_t)in_dim;
-                // for the first layer, only the inputs up to i_feature are computed, the rest is set to zero. This is to compute the contribution of feature i_feature to the final output.
-                if (l == 0){
-                    for (int k = 0; k <= i_feature; k++) {
-                        acc += wrow[k] * in_buf[k];
-                    }
-                } else {
-                    for (int k = 0; k < in_dim; k++) {
-                        acc += wrow[k] * in_buf[k];
-                    }
-                }
-                out_buf[o] = acc;
-            }
-            __syncthreads();
-
-            float* tmp = in_buf;
-            in_buf = out_buf;
-            out_buf = tmp;
-        }
-        return in_buf;
-    }
     // This kernel assumes a single sample (sample 0). Each block processes one permutation
     // instance: blocks [0..n_permutations-1] use the permutation in forward order,
     // blocks [n_permutations..2*n_permutations-1] use the same permutation but in reverse.
