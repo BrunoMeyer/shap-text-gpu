@@ -5,7 +5,7 @@ import json
 import math
 import os
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import torch
 from torch import nn
@@ -62,7 +62,7 @@ class DatasetSpec:
     label_field: str
 
 
-def infer_dataset_spec(dataset_name: str, text_field: str | None, label_field: str | None, column_names: List[str]) -> DatasetSpec:
+def infer_dataset_spec(dataset_name: str, text_field: Optional[str], label_field: Optional[str], column_names: List[str]) -> DatasetSpec:
     if text_field and label_field:
         return DatasetSpec(text_field=text_field, label_field=label_field)
 
