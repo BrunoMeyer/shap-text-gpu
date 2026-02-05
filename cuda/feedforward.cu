@@ -207,17 +207,18 @@ __global__ void mlp_forward_kernel(
     }
     __syncthreads();
 
-    // Calculate the classifications up to i feature
+    // Calculate the classifications up to i_feature and record per-feature outputs
+    float* final_buf = nullptr;
     for (int i_feature = 0; i_feature < seq_len; i_feature++) {
-        float* final_buf = mlp_compute_layers_device(buf0, buf1,
-                                                    W_all, b_all,
-                                                    w_offsets, b_offsets,
-                                                    in_dims, out_dims,
-                                                    num_layers,
-                                                    tx, stride, i_feature);
+        final_buf = mlp_compute_layers_device(buf0, buf1,
+                                             W_all, b_all,
+                                             w_offsets, b_offsets,
+                                             in_dims, out_dims,
+                                             num_layers,
+                                             tx, stride, i_feature);
         __syncthreads();
-        // Save the importance of the first feature (index 0) on shap_block
-        if (tx == 0){
+        // Save the output (logit) corresponding to computation using features up to i_feature
+        if (tx == 0) {
             shap_block[i_feature] = final_buf[0];
         }
     }
