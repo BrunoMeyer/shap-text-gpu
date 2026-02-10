@@ -235,9 +235,10 @@ __global__ void mlp_forward_kernel(
     }
     __syncthreads();
 
-    // Now atomically add per-block shap contributions to global shap_out (one atomic per feature per block)
+    // Now atomically add per-block shap contributions to global shap_out (map permuted position -> original index)
     for (int j = tx; j < seq_len; j += stride) {
-        atomicAdd(&shap_out[j], shap_block[j]);
+        int orig_idx = do_reverse ? perm[seq_len - 1 - j] : perm[j];
+        atomicAdd(&shap_out[orig_idx], shap_block[j]);
     }
     __syncthreads();
 }
