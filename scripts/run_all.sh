@@ -97,7 +97,7 @@ done
 
 mkdir -p "$OUT_DIR"
 
-echo "[1/3] Python train+export -> $OUT_DIR"
+echo "[1/4] Python train+export -> $OUT_DIR"
 python3 "$ROOT_DIR/python/train_export.py" \
   --dataset "$DATASET" \
   --tokenizer "$TOKENIZER" \
@@ -116,10 +116,10 @@ python3 "$ROOT_DIR/python/train_export.py" \
   --meta-file "$META_FILE"
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
-  echo "[2/3] Build CUDA binary"
+  echo "[2/4] Build CUDA binary"
   make -C "$ROOT_DIR/cuda" all
 else
-  echo "[2/3] Skipping CUDA build"
+  echo "[2/4] Skipping CUDA build"
 fi
 
 # Read vocab_size from meta json (no jq requirement): small python one-liner
@@ -131,7 +131,7 @@ with open(p, 'r', encoding='utf-8') as f:
 PY
 )"
 
-echo "[3/3] CUDA feedforward"
+echo "[3/4] CUDA feedforward"
 # Create a single-sample dataset file (first sample) and pass that to the CUDA binary
 SINGLE_DATASET="$OUT_DIR/${DATASET_FILE}.single"
 seq_len=$(awk 'NR==1{print $2; exit}' "$OUT_DIR/$DATASET_FILE")
@@ -144,3 +144,10 @@ printf "1 %s\n%s\n" "$seq_len" "$sample_line" > "$SINGLE_DATASET"
   --vocab-size "$VOCAB_SIZE" \
   --threads "$THREADS" \
   --print "$PRINT"
+
+echo "[4/4] Detokenize SHAP for sample 0 -> $OUT_DIR/sample0_shap.txt"
+python3 "$ROOT_DIR/python/detokenize_shap.py" \
+  --dataset "$SINGLE_DATASET" \
+  --meta "$OUT_DIR/$META_FILE" \
+  --sample 0 \
+  --out "$OUT_DIR/sample0_shap.txt"
