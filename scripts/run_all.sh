@@ -5,6 +5,10 @@ set -euo pipefail
 # 1) Python train + export
 # 2) Build CUDA binary
 # 3) Run CUDA feedforward
+# 4) Compute SHAP (linear & permutation) with Python
+# 5) Detokenize SHAP for sample 0
+# 6, 7 and 8) Compare SHAP outputs
+
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR_DEFAULT="$ROOT_DIR/out"
@@ -97,7 +101,7 @@ done
 
 mkdir -p "$OUT_DIR"
 
-echo "[1/4] Python train+export -> $OUT_DIR"
+echo "[1/8] Python train+export -> $OUT_DIR"
 python3 "$ROOT_DIR/python/train_export.py" \
   --dataset "$DATASET" \
   --tokenizer "$TOKENIZER" \
@@ -116,10 +120,10 @@ python3 "$ROOT_DIR/python/train_export.py" \
   --meta-file "$META_FILE"
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
-  echo "[2/4] Build CUDA binary"
+  echo "[2/8] Build CUDA binary"
   make -C "$ROOT_DIR/cuda" all
 else
-  echo "[2/4] Skipping CUDA build"
+  echo "[2/8] Skipping CUDA build"
 fi
 
 # Read vocab_size from meta json (no jq requirement): small python one-liner
@@ -131,7 +135,7 @@ with open(p, 'r', encoding='utf-8') as f:
 PY
 )"
 
-echo "[3/4] CUDA feedforward"
+echo "[3/8] CUDA feedforward"
 # Create a single-sample dataset file (first sample) and pass that to the CUDA binary
 SINGLE_DATASET="$OUT_DIR/${DATASET_FILE}.single"
 seq_len=$(awk 'NR==1{print $2; exit}' "$OUT_DIR/$DATASET_FILE")
@@ -145,9 +149,50 @@ printf "1 %s\n%s\n" "$seq_len" "$sample_line" > "$SINGLE_DATASET"
   --threads "$THREADS" \
   --print "$PRINT"
 
-echo "[4/4] Detokenize SHAP for sample 0 -> $OUT_DIR/sample0_shap.txt"
+echo "[4/8] Compute SHAP (linear & permutation) with Python"
+python3 "$ROOT_DIR/python/compute_shap.py" \
+  --weights "$OUT_DIR/$WEIGHTS_FILE" \
+  --dataset "$SINGLE_DATASET" \
+  --meta "$OUT_DIR/$META_FILE" \
+  --sample 0 \
+  --sample-size "$seq_len" \
+  --explainer linear \
+  --nsamples 1000 \
+  --out "$OUT_DIR/sample0_shap_linear.txt" \
+  --tokenizer "$TOKENIZER"
+
+python3 "$ROOT_DIR/python/compute_shap.py" \
+  --weights "$OUT_DIR/$WEIGHTS_FILE" \
+  --dataset "$SINGLE_DATASET" \
+  --meta "$OUT_DIR/$META_FILE" \
+  --sample 0 \
+  --sample-size "$seq_len" \
+  --explainer permutation \
+  --nsamples 1000 \
+  --out "$OUT_DIR/sample0_shap_permutation.txt" \
+  --tokenizer "$TOKENIZER"
+
+echo "[5/8] Detokenize SHAP for sample 0 -> $OUT_DIR/sample0_shap.txt"
 python3 "$ROOT_DIR/python/detokenize_shap.py" \
   --dataset "$SINGLE_DATASET" \
   --meta "$OUT_DIR/$META_FILE" \
   --sample 0 \
   --out "$OUT_DIR/sample0_shap.txt"
+
+echo "[6/8] Compare Python linear vs permutation -> $OUT_DIR/sample0_shap_compare.txt"
+python3 "$ROOT_DIR/python/compare_shap.py" \
+  "$OUT_DIR/sample0_shap_linear.txt" \
+  "$OUT_DIR/sample0_shap_permutation.txt" \
+  --out "$OUT_DIR/sample0_shap_compare.txt"
+
+echo "[7/8] Compare Python linear vs CUDA -> $OUT_DIR/sample0_shap_linear_vs_cuda.compare.txt"
+python3 "$ROOT_DIR/python/compare_shap.py" \
+  "$OUT_DIR/sample0_shap_linear.txt" \
+  "$OUT_DIR/sample0_shap.txt" \
+  --out "$OUT_DIR/sample0_shap_linear_vs_cuda.compare.txt"
+
+echo "[8/8] Compare Python permutation vs CUDA -> $OUT_DIR/sample0_shap_permutation_vs_cuda.compare.txt"
+python3 "$ROOT_DIR/python/compare_shap.py" \
+  "$OUT_DIR/sample0_shap_permutation.txt" \
+  "$OUT_DIR/sample0_shap.txt" \
+  --out "$OUT_DIR/sample0_shap_permutation_vs_cuda.compare.txt"

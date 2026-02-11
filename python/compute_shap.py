@@ -171,21 +171,43 @@ def main():
     # For fair comparison, use zero baseline / masker (missing features -> 0)
     background = np.zeros((1, x.shape[1]), dtype=np.float32)
 
-    # If explainer is linear, compute exact SHAP for linear model analytically
+    # All explainers require the shap library
+    try:
+        import shap
+    except Exception as e:
+        raise RuntimeError("shap library is required for explainers. Install via 'pip install shap'") from e
+
+    # If explainer is linear, use shap's LinearExplainer on the effective linear model
     if args.explainer == "linear":
+        # Compute effective weight matrix
         W_eff = compute_effective_input_weights(layers, input_cut=sample_size)
         # W_eff shape (out_dim_last, input_dim)
         if target >= W_eff.shape[0]:
             raise IndexError("target-index out of range for model outputs")
-        coeff = W_eff[target]
-        shap_vals = coeff * x.flatten()
+
+        # Compute effective bias by running the model on zero input
+        zero_in = torch.zeros((1, x.shape[1]), dtype=torch.float32)
+        with torch.no_grad():
+            b_eff = model(zero_in).cpu().numpy().reshape(-1)
+
+        # Simple linear model wrapper providing coef_ and intercept_ and predict
+        class _SimpleLinearModel:
+            def __init__(self, W, b):
+                self.coef_ = W
+                self.intercept_ = b
+            def predict(self, X: np.ndarray) -> np.ndarray:
+                return X.dot(self.coef_.T) + self.intercept_
+
+        lm = _SimpleLinearModel(W_eff.astype(np.float32), b_eff.astype(np.float32))
+        expl = shap.LinearExplainer(lm, background)
+        shap_out = expl.shap_values(x)
+        # shap_out may be list (per output) or array
+        if isinstance(shap_out, list):
+            shap_vals = np.array(shap_out[target]).reshape(-1)[:x.shape[1]]
+        else:
+            shap_vals = np.array(shap_out).reshape(-1)[:x.shape[1]]
 
     else:
-        try:
-            import shap
-        except Exception as e:
-            raise RuntimeError("shap library is required for kernel/permutation explainers. Install via 'pip install shap'") from e
-
         # Define a prediction function returning scalar model output for target
         def f(X: np.ndarray) -> np.ndarray:
             # X shape: (nsamples, input_dim)
