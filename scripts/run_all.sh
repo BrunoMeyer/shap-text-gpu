@@ -165,7 +165,7 @@ python3 "$ROOT_DIR/python/compute_shap.py" \
   --weights "$OUT_DIR/$WEIGHTS_FILE" \
   --dataset "$SINGLE_DATASET" \
   --meta "$OUT_DIR/$META_FILE" \
-  --sample "$SAMPLE_ID" \
+  --sample 0 \
   --sample-size "$seq_len" \
   --explainer linear \
   --nsamples "$N_SAMPLES" \
@@ -176,7 +176,7 @@ python3 "$ROOT_DIR/python/compute_shap.py" \
   --weights "$OUT_DIR/$WEIGHTS_FILE" \
   --dataset "$SINGLE_DATASET" \
   --meta "$OUT_DIR/$META_FILE" \
-  --sample "$SAMPLE_ID" \
+  --sample 0 \
   --sample-size "$seq_len" \
   --explainer permutation \
   --nsamples "$N_SAMPLES" \
@@ -187,7 +187,7 @@ echo "[5/8] Detokenize SHAP for sample $SAMPLE_ID -> $OUT_DIR/sample${SAMPLE_ID}
 python3 "$ROOT_DIR/python/detokenize_shap.py" \
   --dataset "$SINGLE_DATASET" \
   --meta "$OUT_DIR/$META_FILE" \
-  --sample "$SAMPLE_ID" \
+  --sample 0 \
   --out "$OUT_DIR/sample${SAMPLE_ID}_shap.txt"
 
 echo "[6/8] Compare Python linear vs permutation -> $OUT_DIR/sample${SAMPLE_ID}_shap_compare.txt"
