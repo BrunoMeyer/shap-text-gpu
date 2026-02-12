@@ -209,8 +209,9 @@ def main() -> None:
     train_n = min(args.train_samples, len(train_split))
     test_n = min(args.test_samples, len(test_split))
 
-    train_split = train_split.select(range(train_n))
-    test_split = test_split.select(range(test_n))
+    # Select N samples, preserving class distribution as much as possible (important for small N)
+    train_split = train_split.shuffle(seed=args.seed).select(range(train_n))
+    test_split = test_split.shuffle(seed=args.seed).select(range(test_n))
 
     def tok_batch(batch):
         enc = tokenizer(
