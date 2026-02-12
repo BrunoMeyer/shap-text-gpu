@@ -28,6 +28,9 @@ DEVICE="auto"
 THREADS=128
 PRINT=10
 
+N_SAMPLES=1
+SAMPLE_ID=0
+
 OUT_DIR="$OUT_DIR_DEFAULT"
 WEIGHTS_FILE="mlp_weights.txt"
 DATASET_FILE="tokenized_dataset.txt"
@@ -60,6 +63,10 @@ CUDA options:
   --threads N               (default: $THREADS)
   --print N                 (default: $PRINT)
 
+SHAP options:
+  --sample N                (default: $SAMPLE_ID)
+  --nsamples N              (default: $N_SAMPLES)
+
 Other:
   --skip-build              skip nvcc build
   -h|--help
@@ -89,6 +96,9 @@ while [[ $# -gt 0 ]]; do
     --weights-file) WEIGHTS_FILE="$2"; shift 2;;
     --dataset-file) DATASET_FILE="$2"; shift 2;;
     --meta-file) META_FILE="$2"; shift 2;;
+
+    --sample) SAMPLE_ID="$2"; shift 2;;
+    --nsamples) N_SAMPLES="$2"; shift 2;;
 
     --threads) THREADS="$2"; shift 2;;
     --print) PRINT="$2"; shift 2;;
@@ -136,10 +146,11 @@ PY
 )"
 
 echo "[3/8] CUDA feedforward"
-# Create a single-sample dataset file (first sample) and pass that to the CUDA binary
+# Create a single-sample dataset file (sample id) and pass that to the CUDA binary
 SINGLE_DATASET="$OUT_DIR/${DATASET_FILE}.single"
 seq_len=$(awk 'NR==1{print $2; exit}' "$OUT_DIR/$DATASET_FILE")
-sample_line=$(sed -n '2p' "$OUT_DIR/$DATASET_FILE")
+# Pick the requested sample (0-based). Dataset lines start at line 2.
+sample_line=$(sed -n "$((2 + SAMPLE_ID))p" "$OUT_DIR/$DATASET_FILE")
 printf "1 %s\n%s\n" "$seq_len" "$sample_line" > "$SINGLE_DATASET"
 
 "$ROOT_DIR/out/feedforward" \
@@ -154,45 +165,45 @@ python3 "$ROOT_DIR/python/compute_shap.py" \
   --weights "$OUT_DIR/$WEIGHTS_FILE" \
   --dataset "$SINGLE_DATASET" \
   --meta "$OUT_DIR/$META_FILE" \
-  --sample 0 \
+  --sample "$SAMPLE_ID" \
   --sample-size "$seq_len" \
   --explainer linear \
-  --nsamples 1000 \
-  --out "$OUT_DIR/sample0_shap_linear.txt" \
+  --nsamples "$N_SAMPLES" \
+  --out "$OUT_DIR/sample${SAMPLE_ID}_shap_linear.txt" \
   --tokenizer "$TOKENIZER"
 
 python3 "$ROOT_DIR/python/compute_shap.py" \
   --weights "$OUT_DIR/$WEIGHTS_FILE" \
   --dataset "$SINGLE_DATASET" \
   --meta "$OUT_DIR/$META_FILE" \
-  --sample 0 \
+  --sample "$SAMPLE_ID" \
   --sample-size "$seq_len" \
   --explainer permutation \
-  --nsamples 1000 \
-  --out "$OUT_DIR/sample0_shap_permutation.txt" \
+  --nsamples "$N_SAMPLES" \
+  --out "$OUT_DIR/sample${SAMPLE_ID}_shap_permutation.txt" \
   --tokenizer "$TOKENIZER"
 
-echo "[5/8] Detokenize SHAP for sample 0 -> $OUT_DIR/sample0_shap.txt"
+echo "[5/8] Detokenize SHAP for sample $SAMPLE_ID -> $OUT_DIR/sample${SAMPLE_ID}_shap.txt"
 python3 "$ROOT_DIR/python/detokenize_shap.py" \
   --dataset "$SINGLE_DATASET" \
   --meta "$OUT_DIR/$META_FILE" \
-  --sample 0 \
-  --out "$OUT_DIR/sample0_shap.txt"
+  --sample "$SAMPLE_ID" \
+  --out "$OUT_DIR/sample${SAMPLE_ID}_shap.txt"
 
-echo "[6/8] Compare Python linear vs permutation -> $OUT_DIR/sample0_shap_compare.txt"
+echo "[6/8] Compare Python linear vs permutation -> $OUT_DIR/sample${SAMPLE_ID}_shap_compare.txt"
 python3 "$ROOT_DIR/python/compare_shap.py" \
-  "$OUT_DIR/sample0_shap_linear.txt" \
-  "$OUT_DIR/sample0_shap_permutation.txt" \
-  --out "$OUT_DIR/sample0_shap_compare.txt"
+  "$OUT_DIR/sample${SAMPLE_ID}_shap_linear.txt" \
+  "$OUT_DIR/sample${SAMPLE_ID}_shap_permutation.txt" \
+  --out "$OUT_DIR/sample${SAMPLE_ID}_shap_compare.txt"
 
-echo "[7/8] Compare Python linear vs CUDA -> $OUT_DIR/sample0_shap_linear_vs_cuda.compare.txt"
+echo "[7/8] Compare Python linear vs CUDA -> $OUT_DIR/sample${SAMPLE_ID}_shap_linear_vs_cuda.compare.txt"
 python3 "$ROOT_DIR/python/compare_shap.py" \
-  "$OUT_DIR/sample0_shap_linear.txt" \
-  "$OUT_DIR/sample0_shap.txt" \
-  --out "$OUT_DIR/sample0_shap_linear_vs_cuda.compare.txt"
+  "$OUT_DIR/sample${SAMPLE_ID}_shap_linear.txt" \
+  "$OUT_DIR/sample${SAMPLE_ID}_shap.txt" \
+  --out "$OUT_DIR/sample${SAMPLE_ID}_shap_linear_vs_cuda.compare.txt"
 
-echo "[8/8] Compare Python permutation vs CUDA -> $OUT_DIR/sample0_shap_permutation_vs_cuda.compare.txt"
+echo "[8/8] Compare Python permutation vs CUDA -> $OUT_DIR/sample${SAMPLE_ID}_shap_permutation_vs_cuda.compare.txt"
 python3 "$ROOT_DIR/python/compare_shap.py" \
-  "$OUT_DIR/sample0_shap_permutation.txt" \
-  "$OUT_DIR/sample0_shap.txt" \
-  --out "$OUT_DIR/sample0_shap_permutation_vs_cuda.compare.txt"
+  "$OUT_DIR/sample${SAMPLE_ID}_shap_permutation.txt" \
+  "$OUT_DIR/sample${SAMPLE_ID}_shap.txt" \
+  --out "$OUT_DIR/sample${SAMPLE_ID}_shap_permutation_vs_cuda.compare.txt"
