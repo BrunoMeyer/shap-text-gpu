@@ -394,6 +394,11 @@ int main(int argc, char** argv) {
         checkCuda(cudaMalloc(&d_shap, (size_t)ds.seq_len * sizeof(float)), "cudaMalloc d_shap");
         checkCuda(cudaMemset(d_shap, 0, (size_t)ds.seq_len * sizeof(float)), "memset d_shap");
 
+        cudaEvent_t ev_start, ev_stop;
+        checkCuda(cudaEventCreate(&ev_start), "create event start");
+        checkCuda(cudaEventCreate(&ev_stop), "create event stop");
+        checkCuda(cudaEventRecord(ev_start), "record event start");
+
         mlp_forward_kernel<<<grid, block, shmem>>>(
             d_token_ids,
             n_permutations,
@@ -412,7 +417,14 @@ int main(int argc, char** argv) {
             max_dim
         );
         checkCuda(cudaGetLastError(), "kernel launch");
+        checkCuda(cudaEventRecord(ev_stop), "record event stop");
+        checkCuda(cudaEventSynchronize(ev_stop), "synchronize event stop");
+        float elapsed_ms = 0.0f;
+        checkCuda(cudaEventElapsedTime(&elapsed_ms, ev_start, ev_stop), "elapsed time");
+        std::cout << "cuda_kernel_time_ms=" << elapsed_ms << "\n";
         checkCuda(cudaDeviceSynchronize(), "device sync");
+        checkCuda(cudaEventDestroy(ev_start), "destroy event start");
+        checkCuda(cudaEventDestroy(ev_stop), "destroy event stop");
 
         size_t out_count = (size_t)2 * (size_t)n_permutations;
         std::vector<float> h_logits(out_count);

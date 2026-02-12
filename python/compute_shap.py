@@ -30,6 +30,7 @@ from typing import List, Tuple, Optional
 
 import numpy as np
 import torch
+import time
 
 
 def parse_args():
@@ -200,7 +201,10 @@ def main():
 
         lm = _SimpleLinearModel(W_eff.astype(np.float32), b_eff.astype(np.float32))
         expl = shap.LinearExplainer(lm, background)
+        t0 = time.perf_counter()
         shap_out = expl.shap_values(x)
+        t1 = time.perf_counter()
+        print(f"linear_explainer_eval_time={t1-t0:.3f}s")
         # shap_out may be list (per output) or array
         if isinstance(shap_out, list):
             shap_vals = np.array(shap_out[target]).reshape(-1)[:x.shape[1]]
@@ -231,13 +235,19 @@ def main():
             try:
                 masker = shap.maskers.Independent(background)
                 expl = shap.Explainer(f, masker, algorithm="permutation")
-                # Use max_evals to control the budget
+                # Use max_evals to control the budget; time the evaluation
+                t0 = time.perf_counter()
                 exp = expl(x, max_evals=args.nsamples)
+                t1 = time.perf_counter()
+                print(f"permutation_explainer_eval_time={t1-t0:.3f}s")
                 shap_vals = np.array(exp.values).reshape(-1, x.shape[1])[0]
             except Exception:
                 # Fallback: run shap.Explainer without masker kwargs
                 expl = shap.Explainer(f, algorithm="permutation")
+                t0 = time.perf_counter()
                 exp = expl(x, max_evals=args.nsamples)
+                t1 = time.perf_counter()
+                print(f"permutation_explainer_eval_time={t1-t0:.3f}s")
                 shap_vals = np.array(exp.values).reshape(-1, x.shape[1])[0]
 
         else:
