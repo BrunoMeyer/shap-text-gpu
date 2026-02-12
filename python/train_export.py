@@ -264,6 +264,10 @@ def main() -> None:
         test_loss, test_acc = evaluate(model, test_loader, device)
         print(f"epoch={epoch} train_loss={running/max(seen,1):.4f} test_loss={test_loss:.4f} test_acc={test_acc:.4f}")
 
+    # Final evaluation after training: print final test accuracy for callers/scripts
+    final_test_loss, final_test_acc = evaluate(model, test_loader, device)
+    print(f"final_test_loss={final_test_loss:.4f} final_test_acc={final_test_acc:.4f}")
+
     # Export (CUDA will use token IDs and do the same normalization)
     export_weights_text(model, weights_path)
     export_dataset_text(test_ids, test_y, dataset_path)
