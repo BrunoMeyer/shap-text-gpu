@@ -45,6 +45,7 @@ def parse_args():
     p.add_argument("--target-index", type=int, default=0, help="Target output index/class to explain (default 0)")
     p.add_argument("--out", type=str, default=None, help="Output text path (defaults to <dataset>.sampleX.shap.txt)")
     p.add_argument("--tokenizer", type=str, default=None, help="Override tokenizer name in meta")
+    p.add_argument("--npermutations", type=int, default=1000, help="Number of permutations for permutation explainer (if supported by shap version)")
     return p.parse_args()
 
 
@@ -237,7 +238,7 @@ def main():
                 expl = shap.Explainer(f, masker, algorithm="permutation")
                 # Use max_evals to control the budget; time the evaluation
                 t0 = time.perf_counter()
-                exp = expl(x, max_evals=args.nsamples)
+                exp = expl(x, max_evals=args.npermutations)
                 t1 = time.perf_counter()
                 print(f"permutation_explainer_eval_time={t1-t0:.3f}s")
                 shap_vals = np.array(exp.values).reshape(-1, x.shape[1])[0]
@@ -245,7 +246,7 @@ def main():
                 # Fallback: run shap.Explainer without masker kwargs
                 expl = shap.Explainer(f, algorithm="permutation")
                 t0 = time.perf_counter()
-                exp = expl(x, max_evals=args.nsamples)
+                exp = expl(x, max_evals=args.npermutations)
                 t1 = time.perf_counter()
                 print(f"permutation_explainer_eval_time={t1-t0:.3f}s")
                 shap_vals = np.array(exp.values).reshape(-1, x.shape[1])[0]

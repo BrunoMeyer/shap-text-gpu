@@ -30,6 +30,7 @@ PRINT=10
 
 N_SAMPLES=1
 SAMPLE_ID=0
+N_PERMUTATIONS=129
 
 OUT_DIR="$OUT_DIR_DEFAULT"
 WEIGHTS_FILE="mlp_weights.txt"
@@ -66,7 +67,7 @@ CUDA options:
 SHAP options:
   --sample N                (default: $SAMPLE_ID)
   --nsamples N              (default: $N_SAMPLES)
-
+  --npermutations N         (default: $N_PERMUTATIONS)
 Other:
   --skip-build              skip nvcc build
   -h|--help
@@ -99,7 +100,7 @@ while [[ $# -gt 0 ]]; do
 
     --sample) SAMPLE_ID="$2"; shift 2;;
     --nsamples) N_SAMPLES="$2"; shift 2;;
-
+    --npermutations) N_PERMUTATIONS="$2"; shift 2;;
     --threads) THREADS="$2"; shift 2;;
     --print) PRINT="$2"; shift 2;;
 
@@ -158,7 +159,8 @@ printf "1 %s\n%s\n" "$seq_len" "$sample_line" > "$SINGLE_DATASET"
   --dataset "$SINGLE_DATASET" \
   --vocab-size "$VOCAB_SIZE" \
   --threads "$THREADS" \
-  --print "$PRINT"
+  --print "$PRINT" \
+  --npermutations "$N_PERMUTATIONS" \
 
 echo "[4/8] Compute SHAP (linear & permutation) with Python"
 python3 "$ROOT_DIR/python/compute_shap.py" \
@@ -180,6 +182,7 @@ python3 "$ROOT_DIR/python/compute_shap.py" \
   --sample-size "$seq_len" \
   --explainer permutation \
   --nsamples "$N_SAMPLES" \
+  --npermutations "$N_PERMUTATIONS" \
   --out "$OUT_DIR/sample${SAMPLE_ID}_shap_permutation.txt" \
   --tokenizer "$TOKENIZER"
 
