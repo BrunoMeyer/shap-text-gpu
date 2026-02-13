@@ -287,13 +287,9 @@ int main(int argc, char** argv) {
         else if (a == "--threads" && i + 1 < argc) threads = std::stoi(argv[++i]);
         else if (a == "--print" && i + 1 < argc) max_print = std::stoi(argv[++i]);
         else if (a == "--n-permutations" && i + 1 < argc) {
-            // number of base permutations (kernel will launch 2 * n_permutations blocks)
-            // default below is 10
-            // parsed into n_permutations variable set later
-            // store temporarily in max_print as sentinel? instead introduce var after parsing
-            max_print = max_print; // no-op to keep structure; actual parsing handled below
-            // We'll parse again later; preserve compatibility with existing flags
-            i -= 0;
+            // number of base permutations is parsed in the second pass below.
+            // Consume the next token here so it is not treated as an unknown arg.
+            ++i;
         }
         else {
             std::cerr << "Unknown/invalid arg: " << a << "\n";
