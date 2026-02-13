@@ -160,7 +160,7 @@ printf "1 %s\n%s\n" "$seq_len" "$sample_line" > "$SINGLE_DATASET"
   --vocab-size "$VOCAB_SIZE" \
   --threads "$THREADS" \
   --print "$PRINT" \
-  --npermutations "$N_PERMUTATIONS" \
+  --n-permutations "$N_PERMUTATIONS" \
 
 echo "[4/8] Compute SHAP (linear & permutation) with Python"
 python3 "$ROOT_DIR/python/compute_shap.py" \
