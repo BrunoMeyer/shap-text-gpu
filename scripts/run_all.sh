@@ -29,7 +29,7 @@ THREADS=128
 PRINT=10
 
 N_SAMPLES=1
-SAMPLE_ID=0
+#SAMPLE_ID=0
 N_PERMUTATIONS=129
 
 OUT_DIR="$OUT_DIR_DEFAULT"
@@ -65,7 +65,6 @@ CUDA options:
   --print N                 (default: $PRINT)
 
 SHAP options:
-  --sample N                (default: $SAMPLE_ID)
   --nsamples N              (default: $N_SAMPLES)
   --npermutations N         (default: $N_PERMUTATIONS)
 Other:
@@ -98,7 +97,7 @@ while [[ $# -gt 0 ]]; do
     --dataset-file) DATASET_FILE="$2"; shift 2;;
     --meta-file) META_FILE="$2"; shift 2;;
 
-    --sample) SAMPLE_ID="$2"; shift 2;;
+    #--sample) SAMPLE_ID="$2"; shift 2;;
     --nsamples) N_SAMPLES="$2"; shift 2;;
     --npermutations) N_PERMUTATIONS="$2"; shift 2;;
     --threads) THREADS="$2"; shift 2;;
@@ -146,67 +145,198 @@ with open(p, 'r', encoding='utf-8') as f:
 PY
 )"
 
-echo "[3/8] CUDA feedforward"
-# Create a single-sample dataset file (sample id) and pass that to the CUDA binary
-SINGLE_DATASET="$OUT_DIR/${DATASET_FILE}.single"
+echo "[3/8] CUDA feedforward (running per-sample)"
+# Read seq_len and total samples from dataset header
 seq_len=$(awk 'NR==1{print $2; exit}' "$OUT_DIR/$DATASET_FILE")
-# Pick the requested sample (0-based). Dataset lines start at line 2.
+total_samples=$(awk 'NR==1{print $1; exit}' "$OUT_DIR/$DATASET_FILE")
+
+# Run feedforward for each sample (dataset lines start at line 2).
+# Prepare time accumulation
+sum_times=0.0
+count_times=0
+TIMES_FILE="$OUT_DIR/shap_times_ms.csv"
+echo "sample_idx,cuda_kernel_time_ms" > "$TIMES_FILE"
+for ((i=0;i<total_samples;i++)); do
+  SAMPLE_DATASET="$OUT_DIR/${DATASET_FILE}.single.$i"
+  sample_line=$(sed -n "$((2 + i))p" "$OUT_DIR/$DATASET_FILE")
+  printf "1 %s\n%s\n" "$seq_len" "$sample_line" > "$SAMPLE_DATASET"
+
+  echo "  running feedforward for sample $i"
+  # Capture output so we can extract the cuda kernel timing
+  ff_out=$("$ROOT_DIR/out/feedforward" \
+    --weights "$OUT_DIR/$WEIGHTS_FILE" \
+    --dataset "$SAMPLE_DATASET" \
+    --vocab-size "$VOCAB_SIZE" \
+    --threads "$THREADS" \
+    --print "$PRINT" \
+    #--n-permutations "$N_PERMUTATIONS" \
+    2>&1)
+  # Print the captured output to console
+  printf "%s\n" "$ff_out"
+
+  # Extract cuda kernel time in milliseconds (line like: cuda_kernel_time_ms=123.45)
+  t_ms=$(printf "%s\n" "$ff_out" | awk -F"=" '/^cuda_kernel_time_ms=/{print $2; exit}')
+  if [[ -n "$t_ms" ]]; then
+    # append per-sample time
+    echo "$i,$t_ms" >> "$TIMES_FILE"
+    # accumulate using awk for floating-point arithmetic
+    sum_times=$(awk "BEGIN{print $sum_times + $t_ms}")
+    count_times=$((count_times+1))
+  else
+    echo "warning: cuda_kernel_time_ms not found for sample $i" >&2
+  fi
+done
+
+# Compute average time per sample (ms) and write summary
+if [[ $count_times -gt 0 ]]; then
+  avg_time_ms=$(awk "BEGIN{print $sum_times / $count_times}")
+else
+  avg_time_ms=0
+fi
+TIME_SUMMARY="$OUT_DIR/shap_times_summary.txt"
+cat > "$TIME_SUMMARY" <<EOF
+n_samples_timed: $count_times
+total_time_ms: $sum_times
+avg_time_per_sample_ms: $avg_time_ms
+EOF
+echo "Wrote SHAP timing summary to: $TIME_SUMMARY"
+
+# Combine per-sample shap CSVs into a single CSV for all samples
+ALL_SHAP="$OUT_DIR/${DATASET_FILE}.all_shap_values.csv"
+echo "sample_idx,feature_idx,token_id,shap_value" > "$ALL_SHAP"
+for ((i=0;i<total_samples;i++)); do
+  src="$OUT_DIR/${DATASET_FILE}.single.$i.shap_values.csv"
+  if [[ -f "$src" ]]; then
+    # Skip header and prefix each row with the sample index
+    tail -n +2 "$src" | while IFS= read -r line; do
+      printf "%d,%s\n" "$i" "$line" >> "$ALL_SHAP"
+    done
+  else
+    echo "warning: missing per-sample shap file: $src" >&2
+  fi
+done
+
+# Prepare SINGLE_DATASET for downstream steps (use requested SAMPLE_ID)
+SINGLE_DATASET="$OUT_DIR/${DATASET_FILE}.single"
 sample_line=$(sed -n "$((2 + SAMPLE_ID))p" "$OUT_DIR/$DATASET_FILE")
 printf "1 %s\n%s\n" "$seq_len" "$sample_line" > "$SINGLE_DATASET"
 
-"$ROOT_DIR/out/feedforward" \
-  --weights "$OUT_DIR/$WEIGHTS_FILE" \
-  --dataset "$SINGLE_DATASET" \
-  --vocab-size "$VOCAB_SIZE" \
-  --threads "$THREADS" \
-  --print "$PRINT" \
-  --n-permutations "$N_PERMUTATIONS" \
+# Also extract the requested SAMPLE_ID rows into the expected single-sample shap CSV
+# Do not create a separate per-sample shap CSV; downstream tools will read
+# the combined CSV. We will pass the filtered rows for SAMPLE_ID to the
+# detokenize step via process substitution.
 
-echo "[4/8] Compute SHAP (linear & permutation) with Python"
-python3 "$ROOT_DIR/python/compute_shap.py" \
-  --weights "$OUT_DIR/$WEIGHTS_FILE" \
-  --dataset "$SINGLE_DATASET" \
-  --meta "$OUT_DIR/$META_FILE" \
-  --sample 0 \
-  --sample-size "$seq_len" \
-  --explainer linear \
-  --nsamples "$N_SAMPLES" \
-  --out "$OUT_DIR/sample${SAMPLE_ID}_shap_linear.txt" \
-  --tokenizer "$TOKENIZER"
+echo "[4/8] Compute SHAP (permutation) for all samples with Python"
+# Prepare timing for permutation SHAP
+PERM_TIMES_FILE="$OUT_DIR/permutation_shap_times_ms.csv"
+echo "sample_idx,perm_shap_time_ms" > "$PERM_TIMES_FILE"
+sum_perm_times=0.0
+count_perm_times=0
+for ((i=0;i<total_samples;i++)); do
+  PER_SAMPLE_DS="$OUT_DIR/${DATASET_FILE}.single.$i"
+  echo "  computing permutation SHAP for sample $i"
+  # Capture compute_shap output to extract the internal permutation timing
+  out=$(python3 "$ROOT_DIR/python/compute_shap.py" \
+    --weights "$OUT_DIR/$WEIGHTS_FILE" \
+    --dataset "$PER_SAMPLE_DS" \
+    --meta "$OUT_DIR/$META_FILE" \
+    --sample 0 \
+    --sample-size "$seq_len" \
+    --explainer permutation \
+    --nsamples "$N_SAMPLES" \
+    #--npermutations "$N_PERMUTATIONS" \
+    --out "$OUT_DIR/sample${i}_shap_permutation.txt" \
+    --tokenizer "$TOKENIZER" 2>&1) || true
+  printf "%s\n" "$out"
 
-python3 "$ROOT_DIR/python/compute_shap.py" \
-  --weights "$OUT_DIR/$WEIGHTS_FILE" \
-  --dataset "$SINGLE_DATASET" \
-  --meta "$OUT_DIR/$META_FILE" \
-  --sample 0 \
-  --sample-size "$seq_len" \
-  --explainer permutation \
-  --nsamples "$N_SAMPLES" \
-  --npermutations "$N_PERMUTATIONS" \
-  --out "$OUT_DIR/sample${SAMPLE_ID}_shap_permutation.txt" \
-  --tokenizer "$TOKENIZER"
+  # Look for the line like: permutation_explainer_eval_time=0.123s
+  t_s=$(printf "%s\n" "$out" | awk -F"=" '/permutation_explainer_eval_time=/{print $2; exit}')
+  if [[ -n "$t_s" ]]; then
+    # strip trailing 's' and convert to milliseconds
+    t_s=${t_s%s}
+    elapsed_ms=$(awk -v t="$t_s" 'BEGIN{print t * 1000}')
+    echo "$i,$elapsed_ms" >> "$PERM_TIMES_FILE"
+    sum_perm_times=$(awk "BEGIN{print $sum_perm_times + $elapsed_ms}")
+    count_perm_times=$((count_perm_times+1))
+  else
+    echo "warning: permutation_explainer_eval_time not found for sample $i" >&2
+  fi
+done
 
-echo "[5/8] Detokenize SHAP for sample $SAMPLE_ID -> $OUT_DIR/sample${SAMPLE_ID}_shap.txt"
-python3 "$ROOT_DIR/python/detokenize_shap.py" \
-  --dataset "$SINGLE_DATASET" \
-  --meta "$OUT_DIR/$META_FILE" \
-  --sample 0 \
-  --out "$OUT_DIR/sample${SAMPLE_ID}_shap.txt"
+# Write permutation SHAP timing summary
+if [[ $count_perm_times -gt 0 ]]; then
+  avg_perm_time_ms=$(awk "BEGIN{print $sum_perm_times / $count_perm_times}")
+else
+  avg_perm_time_ms=0
+fi
+PERM_TIME_SUMMARY="$OUT_DIR/permutation_shap_times_summary.txt"
+cat > "$PERM_TIME_SUMMARY" <<EOF
+n_samples_timed: $count_perm_times
+total_perm_time_ms: $sum_perm_times
+avg_perm_time_per_sample_ms: $avg_perm_time_ms
+EOF
+echo "Wrote permutation SHAP timing summary to: $PERM_TIME_SUMMARY"
 
-echo "[6/8] Compare Python linear vs permutation -> $OUT_DIR/sample${SAMPLE_ID}_shap_compare.txt"
-python3 "$ROOT_DIR/python/compare_shap.py" \
-  "$OUT_DIR/sample${SAMPLE_ID}_shap_linear.txt" \
-  "$OUT_DIR/sample${SAMPLE_ID}_shap_permutation.txt" \
-  --out "$OUT_DIR/sample${SAMPLE_ID}_shap_compare.txt"
+echo "[8/8] Compare Python permutation vs CUDA across dataset"
+# For each sample: detokenize CUDA shap CSV, compare against Python permutation SHAP,
+# collect per-sample mean_diff and mean_abs_diff, then compute dataset averages.
+sum_diff=0.0
+sum_abs_diff=0.0
+count_cmp=0
+for ((i=0;i<total_samples;i++)); do
+  PY_FILE="$OUT_DIR/sample${i}_shap_permutation.txt"
+  CUDA_CSV="$OUT_DIR/${DATASET_FILE}.single.$i.shap_values.csv"
+  CUDA_DETOK="$OUT_DIR/sample${i}_shap_cuda.txt"
+  COMP_OUT="$OUT_DIR/sample${i}_shap_permutation_vs_cuda.compare.txt"
 
-echo "[7/8] Compare Python linear vs CUDA -> $OUT_DIR/sample${SAMPLE_ID}_shap_linear_vs_cuda.compare.txt"
-python3 "$ROOT_DIR/python/compare_shap.py" \
-  "$OUT_DIR/sample${SAMPLE_ID}_shap_linear.txt" \
-  "$OUT_DIR/sample${SAMPLE_ID}_shap.txt" \
-  --out "$OUT_DIR/sample${SAMPLE_ID}_shap_linear_vs_cuda.compare.txt"
+  if [[ ! -f "$PY_FILE" ]]; then
+    echo "warning: missing python shap file: $PY_FILE" >&2
+    continue
+  fi
+  if [[ ! -f "$CUDA_CSV" ]]; then
+    echo "warning: missing cuda shap csv: $CUDA_CSV" >&2
+    continue
+  fi
 
-echo "[8/8] Compare Python permutation vs CUDA -> $OUT_DIR/sample${SAMPLE_ID}_shap_permutation_vs_cuda.compare.txt"
-python3 "$ROOT_DIR/python/compare_shap.py" \
-  "$OUT_DIR/sample${SAMPLE_ID}_shap_permutation.txt" \
-  "$OUT_DIR/sample${SAMPLE_ID}_shap.txt" \
-  --out "$OUT_DIR/sample${SAMPLE_ID}_shap_permutation_vs_cuda.compare.txt"
+  # Detokenize CUDA shap CSV for sample i
+  python3 "$ROOT_DIR/python/detokenize_shap.py" \
+    --dataset "$OUT_DIR/${DATASET_FILE}.single.$i" \
+    --meta "$OUT_DIR/$META_FILE" \
+    --shap-csv "$CUDA_CSV" \
+    --sample 0 \
+    --out "$CUDA_DETOK"
+
+  # Compare python vs cuda for this sample
+  python3 "$ROOT_DIR/python/compare_shap.py" \
+    "$PY_FILE" \
+    "$CUDA_DETOK" \
+    --out "$COMP_OUT"
+
+  # Extract mean_diff and mean_abs_diff from compare output
+  md=$(awk -F": " '/^mean_diff:/{print $2; exit}' "$COMP_OUT" || echo "0")
+  mad=$(awk -F": " '/^mean_abs_diff:/{print $2; exit}' "$COMP_OUT" || echo "0")
+  # Ensure numeric (fallback to 0)
+  md=$(printf "%f" "$md" 2>/dev/null || echo "0")
+  mad=$(printf "%f" "$mad" 2>/dev/null || echo "0")
+
+  sum_diff=$(awk "BEGIN{print $sum_diff + $md}")
+  sum_abs_diff=$(awk "BEGIN{print $sum_abs_diff + $mad}")
+  count_cmp=$((count_cmp+1))
+done
+
+if [[ $count_cmp -gt 0 ]]; then
+  avg_diff=$(awk "BEGIN{print $sum_diff / $count_cmp}")
+  avg_abs_diff=$(awk "BEGIN{print $sum_abs_diff / $count_cmp}")
+else
+  avg_diff=0
+  avg_abs_diff=0
+fi
+
+SUMMARY_OUT="$OUT_DIR/shap_dataset_compare_summary.txt"
+cat > "$SUMMARY_OUT" <<EOF
+n_compared: $count_cmp
+mean_diff_across_dataset: $avg_diff
+mean_abs_diff_across_dataset: $avg_abs_diff
+EOF
+
+echo "Wrote dataset comparison summary to: $SUMMARY_OUT"
