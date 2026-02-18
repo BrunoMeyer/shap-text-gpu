@@ -179,8 +179,11 @@ for ((i=0;i<total_samples;i++)); do
   if [[ -n "$t_ms" ]]; then
     # append per-sample time
     echo "$i,$t_ms" >> "$TIMES_FILE"
-    # accumulate using awk for floating-point arithmetic
-    sum_times=$(awk "BEGIN{print $sum_times + $t_ms}")
+    # accumulate using python for floating-point arithmetic
+    sum_times=$(python3 - <<PY
+  print(float("$sum_times") + float("$t_ms"))
+  PY
+  )
     count_times=$((count_times+1))
   else
     echo "warning: cuda_kernel_time_ms not found for sample $i" >&2
@@ -189,7 +192,10 @@ done
 
 # Compute average time per sample (ms) and write summary
 if [[ $count_times -gt 0 ]]; then
-  avg_time_ms=$(awk "BEGIN{print $sum_times / $count_times}")
+  avg_time_ms=$(python3 - <<PY
+print(float("$sum_times") / float($count_times))
+PY
+)
 else
   avg_time_ms=0
 fi
@@ -254,9 +260,15 @@ for ((i=0;i<total_samples;i++)); do
   if [[ -n "$t_s" ]]; then
     # strip trailing 's' and convert to milliseconds
     t_s=${t_s%s}
-    elapsed_ms=$(awk -v t="$t_s" 'BEGIN{print t * 1000}')
+    elapsed_ms=$(python3 - <<PY
+  print(float("$t_s") * 1000.0)
+  PY
+  )
     echo "$i,$elapsed_ms" >> "$PERM_TIMES_FILE"
-    sum_perm_times=$(awk "BEGIN{print $sum_perm_times + $elapsed_ms}")
+    sum_perm_times=$(python3 - <<PY
+  print(float("$sum_perm_times") + float("$elapsed_ms"))
+  PY
+  )
     count_perm_times=$((count_perm_times+1))
   else
     echo "warning: permutation_explainer_eval_time not found for sample $i" >&2
@@ -265,7 +277,10 @@ done
 
 # Write permutation SHAP timing summary
 if [[ $count_perm_times -gt 0 ]]; then
-  avg_perm_time_ms=$(awk "BEGIN{print $sum_perm_times / $count_perm_times}")
+  avg_perm_time_ms=$(python3 - <<PY
+print(float("$sum_perm_times") / float($count_perm_times))
+PY
+)
 else
   avg_perm_time_ms=0
 fi
@@ -319,14 +334,26 @@ for ((i=0;i<total_samples;i++)); do
   md=$(printf "%f" "$md" 2>/dev/null || echo "0")
   mad=$(printf "%f" "$mad" 2>/dev/null || echo "0")
 
-  sum_diff=$(awk "BEGIN{print $sum_diff + $md}")
-  sum_abs_diff=$(awk "BEGIN{print $sum_abs_diff + $mad}")
+  sum_diff=$(python3 - <<PY
+print(float("$sum_diff") + float("$md"))
+PY
+)
+  sum_abs_diff=$(python3 - <<PY
+print(float("$sum_abs_diff") + float("$mad"))
+PY
+)
   count_cmp=$((count_cmp+1))
 done
 
 if [[ $count_cmp -gt 0 ]]; then
-  avg_diff=$(awk "BEGIN{print $sum_diff / $count_cmp}")
-  avg_abs_diff=$(awk "BEGIN{print $sum_abs_diff / $count_cmp}")
+  avg_diff=$(python3 - <<PY
+print(float("$sum_diff") / float($count_cmp))
+PY
+)
+  avg_abs_diff=$(python3 - <<PY
+print(float("$sum_abs_diff") / float($count_cmp))
+PY
+)
 else
   avg_diff=0
   avg_abs_diff=0
