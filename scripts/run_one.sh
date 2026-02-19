@@ -182,7 +182,6 @@ python3 "$ROOT_DIR/python/compute_shap.py" \
   --sample-size "$seq_len" \
   --explainer permutation \
   --nsamples "$N_SAMPLES" \
-#  --npermutations "$N_PERMUTATIONS" \
   --out "$OUT_DIR/sample${SAMPLE_ID}_shap_permutation.txt" \
   --tokenizer "$TOKENIZER"
 
