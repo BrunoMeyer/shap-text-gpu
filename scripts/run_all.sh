@@ -182,8 +182,8 @@ for ((i=0;i<total_samples;i++)); do
     # accumulate using python for floating-point arithmetic
     sum_times=$(python3 - <<PY
   print(float("$sum_times") + float("$t_ms"))
-  PY
-  )
+PY
+    )
     count_times=$((count_times+1))
   else
     echo "warning: cuda_kernel_time_ms not found for sample $i" >&2
@@ -262,12 +262,12 @@ for ((i=0;i<total_samples;i++)); do
     t_s=${t_s%s}
     elapsed_ms=$(python3 - <<PY
   print(float("$t_s") * 1000.0)
-  PY
+PY
   )
     echo "$i,$elapsed_ms" >> "$PERM_TIMES_FILE"
     sum_perm_times=$(python3 - <<PY
   print(float("$sum_perm_times") + float("$elapsed_ms"))
-  PY
+PY
   )
     count_perm_times=$((count_perm_times+1))
   else
