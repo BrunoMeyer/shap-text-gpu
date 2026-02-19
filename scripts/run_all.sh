@@ -111,7 +111,7 @@ done
 
 mkdir -p "$OUT_DIR"
 
-echo "[1/8] Python train+export -> $OUT_DIR"
+echo "[1/5] Python train+export -> $OUT_DIR"
 python3 "$ROOT_DIR/python/train_export.py" \
   --dataset "$DATASET" \
   --tokenizer "$TOKENIZER" \
@@ -130,10 +130,10 @@ python3 "$ROOT_DIR/python/train_export.py" \
   --meta-file "$META_FILE"
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
-  echo "[2/8] Build CUDA binary"
+  echo "[2/5] Build CUDA binary"
   make -C "$ROOT_DIR/cuda" all
 else
-  echo "[2/8] Skipping CUDA build"
+  echo "[2/5] Skipping CUDA build"
 fi
 
 # Read vocab_size from meta json (no jq requirement): small python one-liner
@@ -145,7 +145,7 @@ with open(p, 'r', encoding='utf-8') as f:
 PY
 )"
 
-echo "[3/8] CUDA feedforward (running per-sample)"
+echo "[3/5] CUDA feedforward (running per-sample)"
 # Read seq_len and total samples from dataset header
 seq_len=$(awk 'NR==1{print $2; exit}' "$OUT_DIR/$DATASET_FILE")
 total_samples=$(awk 'NR==1{print $1; exit}' "$OUT_DIR/$DATASET_FILE")
@@ -169,7 +169,6 @@ for ((i=0;i<total_samples;i++)); do
     --vocab-size "$VOCAB_SIZE" \
     --threads "$THREADS" \
     --print "$PRINT" \
-    #--n-permutations "$N_PERMUTATIONS" \
     2>&1)
   # Print the captured output to console
   printf "%s\n" "$ff_out"
@@ -222,77 +221,19 @@ for ((i=0;i<total_samples;i++)); do
   fi
 done
 
-# Prepare SINGLE_DATASET for downstream steps (use requested SAMPLE_ID)
-SINGLE_DATASET="$OUT_DIR/${DATASET_FILE}.single"
-sample_line=$(sed -n "$((2 + SAMPLE_ID))p" "$OUT_DIR/$DATASET_FILE")
-printf "1 %s\n%s\n" "$seq_len" "$sample_line" > "$SINGLE_DATASET"
 
-# Also extract the requested SAMPLE_ID rows into the expected single-sample shap CSV
-# Do not create a separate per-sample shap CSV; downstream tools will read
-# the combined CSV. We will pass the filtered rows for SAMPLE_ID to the
-# detokenize step via process substitution.
+echo "[4/5] Compute SHAP (linear & permutation) with Python"
+python3 "$ROOT_DIR/python/compute_shap.py" \
+  --weights "$OUT_DIR/$WEIGHTS_FILE" \
+  --dataset "$DATASET_FILE" \
+  --meta "$OUT_DIR/$META_FILE" \
+  --sample-size "$seq_len" \
+  --explainer linear \
+  --nsamples "$N_SAMPLES" \
+  --out "$OUT_DIR/sample${SAMPLE_ID}_shap_linear.txt" \
+  --tokenizer "$TOKENIZER"
 
-echo "[4/8] Compute SHAP (permutation) for all samples with Python"
-# Prepare timing for permutation SHAP
-PERM_TIMES_FILE="$OUT_DIR/permutation_shap_times_ms.csv"
-echo "sample_idx,perm_shap_time_ms" > "$PERM_TIMES_FILE"
-sum_perm_times=0.0
-count_perm_times=0
-for ((i=0;i<total_samples;i++)); do
-  PER_SAMPLE_DS="$OUT_DIR/${DATASET_FILE}.single.$i"
-  echo "  computing permutation SHAP for sample $i"
-  # Capture compute_shap output to extract the internal permutation timing
-  out=$(python3 "$ROOT_DIR/python/compute_shap.py" \
-    --weights "$OUT_DIR/$WEIGHTS_FILE" \
-    --dataset "$PER_SAMPLE_DS" \
-    --meta "$OUT_DIR/$META_FILE" \
-    --sample 0 \
-    --sample-size "$seq_len" \
-    --explainer permutation \
-    --nsamples "$N_SAMPLES" \
-    #--npermutations "$N_PERMUTATIONS" \
-    --out "$OUT_DIR/sample${i}_shap_permutation.txt" \
-    --tokenizer "$TOKENIZER" 2>&1) || true
-  printf "%s\n" "$out"
-
-  # Look for the line like: permutation_explainer_eval_time=0.123s
-  t_s=$(printf "%s\n" "$out" | awk -F"=" '/permutation_explainer_eval_time=/{print $2; exit}')
-  if [[ -n "$t_s" ]]; then
-    # strip trailing 's' and convert to milliseconds
-    t_s=${t_s%s}
-    elapsed_ms=$(python3 - <<PY
-  print(float("$t_s") * 1000.0)
-PY
-  )
-    echo "$i,$elapsed_ms" >> "$PERM_TIMES_FILE"
-    sum_perm_times=$(python3 - <<PY
-  print(float("$sum_perm_times") + float("$elapsed_ms"))
-PY
-  )
-    count_perm_times=$((count_perm_times+1))
-  else
-    echo "warning: permutation_explainer_eval_time not found for sample $i" >&2
-  fi
-done
-
-# Write permutation SHAP timing summary
-if [[ $count_perm_times -gt 0 ]]; then
-  avg_perm_time_ms=$(python3 - <<PY
-print(float("$sum_perm_times") / float($count_perm_times))
-PY
-)
-else
-  avg_perm_time_ms=0
-fi
-PERM_TIME_SUMMARY="$OUT_DIR/permutation_shap_times_summary.txt"
-cat > "$PERM_TIME_SUMMARY" <<EOF
-n_samples_timed: $count_perm_times
-total_perm_time_ms: $sum_perm_times
-avg_perm_time_per_sample_ms: $avg_perm_time_ms
-EOF
-echo "Wrote permutation SHAP timing summary to: $PERM_TIME_SUMMARY"
-
-echo "[8/8] Compare Python permutation vs CUDA across dataset"
+echo "[5/5] Compare Python permutation vs CUDA across dataset"
 # For each sample: detokenize CUDA shap CSV, compare against Python permutation SHAP,
 # collect per-sample mean_diff and mean_abs_diff, then compute dataset averages.
 sum_diff=0.0
