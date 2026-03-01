@@ -136,15 +136,6 @@ else
   echo "[2/4] Skipping CUDA build"
 fi
 
-# Read vocab_size from meta json (no jq requirement): small python one-liner
-VOCAB_SIZE="$(python3 - <<PY
-import json
-p = "${OUT_DIR}/${META_FILE}"
-with open(p, 'r', encoding='utf-8') as f:
-    print(json.load(f)['vocab_size'])
-PY
-)"
-
 echo "[3/4] CUDA emb_shap"
 EMB_BIN="$OUT_DIR/emb_shap"
 if [[ ! -f "$EMB_BIN" ]]; then
@@ -156,8 +147,8 @@ echo "Running emb_shap on exported dataset (this may take time). Output -> $OUT_
 "$EMB_BIN" \
   --weights "$OUT_DIR/$WEIGHTS_FILE" \
   --dataset "$OUT_DIR/$DATASET_FILE" \
+  --npermutations "$N_PERMUTATIONS" \
   --embeddings "$OUT_DIR/embedding_matrix.txt" \
-  --vocab-size "$VOCAB_SIZE" \
   --threads "$THREADS" \
   --print "$PRINT" > "$OUT_DIR/shap_values.txt" 2>&1 || true
 
