@@ -131,7 +131,7 @@ python3 "$ROOT_DIR/embedding/python/train_export_emb.py" \
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   echo "[2/4] Build emb_shap CUDA binary"
-  nvcc -O3 -arch=sm_70 -o "$OUT_DIR/emb_shap" "$ROOT_DIR/cuda/emb_shap.cu"
+  nvcc -O3 -arch=sm_70 -o "$OUT_DIR/emb_shap" "$ROOT_DIR/embedding/cuda/emb_shap.cu"
 else
   echo "[2/4] Skipping CUDA build"
 fi
