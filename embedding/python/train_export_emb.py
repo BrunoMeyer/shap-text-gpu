@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import math
+import os
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
+
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
+from collections import Counter
+from torchtext.data.utils import get_tokenizer
+from torchtext.vocab import vocab as torchtext_vocab
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Train a linear-activation MLP on a public text dataset tokenized with BERT; export weights + tokenized dataset.")
+    p.add_argument("--dataset", type=str, default="imdb", help="HuggingFace datasets name (e.g. ag_news, imdb)")
+    p.add_argument("--text-field", type=str, default=None, help="Optional override for the text column")
+    p.add_argument("--label-field", type=str, default=None, help="Optional override for the label column")
+
+    p.add_argument("--tokenizer", type=str, default="bert-base-uncased", help="Tokenizer name from transformers")
+    p.add_argument("--max-len", type=int, default=128)
+
+    p.add_argument("--hidden-dim", type=int, default=64)
+    p.add_argument("--num-layers", type=int, default=4, help="Total number of Linear layers including output")
+    p.add_argument("--dropout", type=float, default=0.5, help="Dropout applied during training between layers")
+    p.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay for optimizer")
+
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--lr", type=float, default=1e-3)
+
+    p.add_argument("--train-samples", type=int, default=2000)
+    p.add_argument("--test-samples", type=int, default=256)
+
+    p.add_argument("--seed", type=int, default=123)
+    p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+
+    p.add_argument("--out-dir", type=str, default="out")
+    p.add_argument("--weights-file", type=str, default="mlp_weights.txt")
+    p.add_argument("--dataset-file", type=str, default="tokenized_dataset.txt")
+    p.add_argument("--meta-file", type=str, default="export_meta.json")
+
+    return p.parse_args()
+
+
+def set_seed(seed: int) -> None:
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def pick_device(device_arg: str) -> torch.device:
+    if device_arg == "cpu":
+        return torch.device("cpu")
+    if device_arg == "cuda":
+        return torch.device("cuda")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+@dataclass(frozen=True)
+class DatasetSpec:
+    text_field: str
+    label_field: str
+
+
+def infer_dataset_spec(dataset_name: str, text_field: Optional[str], label_field: Optional[str], column_names: List[str]) -> DatasetSpec:
+    if text_field and label_field:
+        return DatasetSpec(text_field=text_field, label_field=label_field)
+
+    # Common defaults
+    if dataset_name == "ag_news":
+        return DatasetSpec(text_field=text_field or "text", label_field=label_field or "label")
+    if dataset_name == "imdb":
+        return DatasetSpec(text_field=text_field or "text", label_field=label_field or "label")
+
+    # Heuristic: prefer these names if present
+    preferred_text = ["text", "sentence", "review", "content"]
+    preferred_label = ["label", "labels", "category"]
+
+    chosen_text = text_field
+    chosen_label = label_field
+
+    if chosen_text is None:
+        for cand in preferred_text:
+            if cand in column_names:
+                chosen_text = cand
+                break
+    if chosen_label is None:
+        for cand in preferred_label:
+            if cand in column_names:
+                chosen_label = cand
+                break
+
+    if chosen_text is None or chosen_label is None:
+        raise ValueError(f"Could not infer text/label fields from columns={column_names}. Provide --text-field/--label-field.")
+
+    return DatasetSpec(text_field=chosen_text, label_field=chosen_label)
+
+
+class LinearMLP(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, num_layers: int):
+        super().__init__()
+        if num_layers < 1:
+            raise ValueError("num_layers must be >= 1")
+
+        layers: List[nn.Module] = []
+        if num_layers == 1:
+            layers.append(nn.Linear(input_dim, output_dim))
+        else:
+            layers.append(nn.Linear(input_dim, hidden_dim))
+            for _ in range(num_layers - 2):
+                layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.Linear(hidden_dim, output_dim))
+
+        self.layers = nn.ModuleList(layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Identity activation between layers ("linear activations")
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+def export_weights_text(model: LinearMLP, path: str) -> None:
+    # Plain-text, easy to parse from C++:
+    # L
+    # in0 out0
+    # W (out0 * in0 floats row-major)
+    # b (out0 floats)
+    # ...
+    layers = list(model.layers)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"{len(layers)}\n")
+        for layer in layers:
+            assert isinstance(layer, nn.Linear)
+            w = layer.weight.detach().cpu().contiguous().float()
+            b = layer.bias.detach().cpu().contiguous().float()
+            out_dim, in_dim = w.shape
+            f.write(f"{in_dim} {out_dim}\n")
+            # weights row-major: row = out, col = in
+            flat_w = w.reshape(-1).tolist()
+            f.write(" ".join(f"{v:.9g}" for v in flat_w) + "\n")
+            f.write(" ".join(f"{v:.9g}" for v in b.tolist()) + "\n")
+
+
+def export_embeddings_text(embedding: nn.Embedding, path: str) -> None:
+    # Format expected by emb_shap.cu: first line "vocab_size embed_dim" then flattened rows
+    w = embedding.weight.detach().cpu().contiguous().float()
+    vocab_size, embed_dim = w.shape
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"{vocab_size} {embed_dim}\n")
+        flat = w.reshape(-1).tolist()
+        f.write(" ".join(f"{v:.9g}" for v in flat) + "\n")
+
+
+def export_vocab_text(vocab, path: str) -> None:
+    """Export vocab index->token mapping as one token per line where line number == index."""
+    # Try to get stoi mapping
+    try:
+        stoi = vocab.get_stoi()
+    except Exception:
+        # Fallback: iterate tokens and query vocab[token]
+        stoi = {t: int(vocab[t]) for t in list(vocab)}
+    # build inverse mapping
+    inv = {int(i): t for t, i in stoi.items()}
+    max_idx = max(inv.keys()) if inv else -1
+    with open(path, "w", encoding="utf-8") as f:
+        for i in range(max_idx + 1):
+            tok = inv.get(i, "<unk>")
+            f.write(tok + "\n")
+
+
+class EmbeddingMLP(nn.Module):
+    """Embedding-based MLP that performs mean-pooling over token embeddings and
+    a sequence of Linear layers with optional dropout. Activations are identity
+    to match emb_shap.cu expectations (linear-only)."""
+    def __init__(self, vocab_size: int, embed_dim: int, hidden_dim: int, num_layers: int, output_dim: int, padding_idx: int, dropout: float = 0.0):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=padding_idx)
+        layers: List[nn.Module] = []
+        if num_layers == 1:
+            layers.append(nn.Linear(embed_dim, output_dim))
+        else:
+            layers.append(nn.Linear(embed_dim, hidden_dim))
+            for _ in range(num_layers - 2):
+                layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.Linear(hidden_dim, output_dim))
+        self.layers = nn.ModuleList(layers)
+        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+        self.padding_idx = padding_idx
+        self.relu = nn.ReLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, seq_len) token ids
+        emb = self.embedding(x)  # (batch, seq_len, embed_dim)
+        mask = (x != self.padding_idx).unsqueeze(-1).to(emb.dtype)
+        summed = (emb * mask).sum(dim=1)
+        lengths = mask.sum(dim=1).clamp(min=1)
+        mean_pooled = summed / lengths
+        out = mean_pooled
+        for i, layer in enumerate(self.layers):
+            out = layer(out)
+            # apply ReLU + dropout for non-final layers
+            if i < (len(self.layers) - 1):
+                out = self.relu(out)
+                out = self.dropout(out)
+        return out
+
+
+def export_dataset_text(token_ids: torch.Tensor, labels: torch.Tensor, path: str) -> None:
+    # Format:
+    # N seq_len
+    # label id0 id1 ... id(seq_len-1)
+    token_ids = token_ids.detach().cpu().to(torch.int32)
+    labels = labels.detach().cpu().to(torch.int32)
+    n, seq_len = token_ids.shape
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"{n} {seq_len}\n")
+        for i in range(n):
+            ids = token_ids[i].tolist()
+            f.write(str(int(labels[i].item())))
+            for t in ids:
+                f.write(" ")
+                f.write(str(int(t)))
+            f.write("\n")
+
+
+@torch.no_grad()
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[float, float]:
+    model.eval()
+    total = 0
+    correct = 0
+    total_loss = 0.0
+    loss_fn = nn.CrossEntropyLoss(reduction="sum")
+    for xb, yb in loader:
+        xb = xb.to(device)
+        yb = yb.to(device)
+        logits = model(xb)
+        total_loss += float(loss_fn(logits, yb).item())
+        pred = logits.argmax(dim=-1)
+        correct += int((pred == yb).sum().item())
+        total += int(yb.numel())
+    return total_loss / max(total, 1), correct / max(total, 1)
+
+
+def main() -> None:
+    args = parse_args()
+    set_seed(args.seed)
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    weights_path = os.path.join(args.out_dir, args.weights_file)
+    dataset_path = os.path.join(args.out_dir, args.dataset_file)
+    meta_path = os.path.join(args.out_dir, args.meta_file)
+
+    device = pick_device(args.device)
+
+    # Lazy imports so error messages are clearer if deps missing.
+    from datasets import load_dataset
+
+    ds = load_dataset(args.dataset)
+    if "train" not in ds:
+        raise ValueError(f"Dataset '{args.dataset}' has no 'train' split")
+
+    train_split = ds["train"]
+    test_split = ds["test"] if "test" in ds else ds["train"]
+
+    spec = infer_dataset_spec(args.dataset, args.text_field, args.label_field, train_split.column_names)
+
+    # Use the same word-level tokenizer + vocab construction as the notebook
+    tokenizer = get_tokenizer("basic_english")
+
+    # Subsample for speed
+    train_n = min(args.train_samples, len(train_split))
+    test_n = min(args.test_samples, len(test_split))
+
+    # Select N samples, preserving class distribution as much as possible (important for small N)
+    train_split = train_split.shuffle(seed=args.seed).select(range(train_n))
+    test_split = test_split.shuffle(seed=args.seed).select(range(test_n))
+
+    counter = Counter()
+    for txt in train_split[spec.text_field]:
+        counter.update(tokenizer(txt))
+    specials = ["<pad>", "<unk>"]
+    vocab = torchtext_vocab(counter, specials=specials)
+    vocab.set_default_index(vocab["<unk>"])
+    pad_idx = int(vocab["<pad>"])
+    vocab_size = len(vocab)
+
+    def tok_batch(batch):
+        ids_batch = []
+        for text in batch[spec.text_field]:
+            toks = tokenizer(text)
+            ids = [vocab[t] for t in toks][: args.max_len]
+            ids_batch.append(ids)
+        return {"input_ids": ids_batch}
+
+    train_tok = train_split.map(tok_batch, batched=True, remove_columns=[c for c in train_split.column_names if c != spec.label_field])
+    test_tok = test_split.map(tok_batch, batched=True, remove_columns=[c for c in test_split.column_names if c != spec.label_field])
+
+    # Convert to tensors (pad/truncate to max_len)
+    def pad_id_lists(id_lists, max_len=args.max_len):
+        tensors = [torch.tensor(ids, dtype=torch.long)[:max_len] for ids in id_lists]
+        if len(tensors) == 0:
+            return torch.empty((0, max_len), dtype=torch.long)
+        padded = torch.nn.utils.rnn.pad_sequence(tensors, batch_first=True, padding_value=pad_idx)
+        if padded.size(1) < max_len:
+            padded = torch.nn.functional.pad(padded, (0, max_len - padded.size(1)), value=pad_idx)
+        else:
+            padded = padded[:, :max_len]
+        return padded
+
+    train_ids = pad_id_lists(train_tok["input_ids"]) 
+    train_y = torch.tensor(train_tok[spec.label_field], dtype=torch.int64)
+    test_ids = pad_id_lists(test_tok["input_ids"]) 
+    test_y = torch.tensor(test_tok[spec.label_field], dtype=torch.int64)
+
+    # We'll train an Embedding-based MLP (mean-pooled embeddings -> MLP).
+    num_classes = int(train_y.max().item() + 1)
+    seq_len = int(train_ids.shape[1])
+
+    model = EmbeddingMLP(vocab_size=vocab_size, embed_dim=args.hidden_dim, hidden_dim=args.hidden_dim, num_layers=args.num_layers, output_dim=num_classes, padding_idx=pad_idx, dropout=args.dropout).to(device)
+
+    train_loader = DataLoader(TensorDataset(train_ids, train_y), batch_size=args.batch_size, shuffle=True)
+    test_loader = DataLoader(TensorDataset(test_ids, test_y), batch_size=args.batch_size, shuffle=False)
+
+    optim = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    loss_fn = nn.CrossEntropyLoss()
+
+    model.train()
+    for epoch in range(1, args.epochs + 1):
+        running = 0.0
+        seen = 0
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            optim.zero_grad(set_to_none=True)
+            logits = model(xb)
+            loss = loss_fn(logits, yb)
+            loss.backward()
+            optim.step()
+            running += float(loss.item()) * int(yb.numel())
+            seen += int(yb.numel())
+
+        test_loss, test_acc = evaluate(model, test_loader, device)
+        print(f"epoch={epoch} train_loss={running/max(seen,1):.4f} test_loss={test_loss:.4f} test_acc={test_acc:.4f}")
+
+    # Final evaluation after training: print final test accuracy for callers/scripts
+    final_test_loss, final_test_acc = evaluate(model, test_loader, device)
+    print(f"final_test_loss={final_test_loss:.4f} final_test_acc={final_test_acc:.4f}")
+
+    # Export embeddings and MLP weights and the tokenized dataset (token ids)
+    export_embeddings_text(model.embedding, os.path.join(args.out_dir, 'embedding_matrix.txt'))
+    export_weights_text(model, weights_path)
+    export_vocab_text(vocab, os.path.join(args.out_dir, 'vocab.txt'))
+    export_dataset_text(test_ids, test_y, dataset_path)
+
+    meta = {
+        "dataset": args.dataset,
+        "tokenizer": args.tokenizer,
+        "vocab_size": vocab_size,
+        "max_len": args.max_len,
+        "embed_dim": args.hidden_dim,
+        "hidden_dim": args.hidden_dim,
+        "num_layers": args.num_layers,
+        "num_classes": num_classes,
+        "export": {
+            "weights_file": os.path.basename(weights_path),
+            "dataset_file": os.path.basename(dataset_path),
+            "embedding_file": 'embedding_matrix.txt',
+        },
+        "feature_transform": "embedding_mean_pool",
+    }
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+    print(f"wrote: {weights_path}")
+    print(f"wrote: {dataset_path}")
+    print(f"wrote: {os.path.join(args.out_dir, 'embedding_matrix.txt')}")
+    print(f"wrote: {meta_path}")
+
+
+if __name__ == "__main__":
+    main()
