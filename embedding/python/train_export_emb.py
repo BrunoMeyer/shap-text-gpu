@@ -21,7 +21,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--text-field", type=str, default=None, help="Optional override for the text column")
     p.add_argument("--label-field", type=str, default=None, help="Optional override for the label column")
 
-    p.add_argument("--tokenizer", type=str, default="bert-base-uncased", help="Tokenizer name from transformers")
     p.add_argument("--max-len", type=int, default=128)
 
     p.add_argument("--hidden-dim", type=int, default=64)
@@ -359,7 +358,6 @@ def main() -> None:
 
     meta = {
         "dataset": args.dataset,
-        "tokenizer": args.tokenizer,
         "vocab_size": vocab_size,
         "max_len": args.max_len,
         "embed_dim": args.hidden_dim,

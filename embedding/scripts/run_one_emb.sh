@@ -8,16 +8,17 @@ set -euo pipefail
 # 5) Detokenize SHAP for sample 0
 
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 OUT_DIR_DEFAULT="$ROOT_DIR/out"
 
 DATASET="imdb"
-TOKENIZER="bert-base-uncased"
-MAX_LEN=64
-HIDDEN_DIM=128
-NUM_LAYERS=3
+MAX_LEN=128
+HIDDEN_DIM=64
+NUM_LAYERS=4
 BATCH_SIZE=64
-EPOCHS=1
+EPOCHS=3
 LR=1e-3
 TRAIN_SAMPLES=2000
 TEST_SAMPLES=256
@@ -41,7 +42,6 @@ Usage: $0 [options]
 
 Python/training options:
   --dataset NAME            (default: $DATASET)
-  --tokenizer NAME          (default: $TOKENIZER)
   --max-len N               (default: $MAX_LEN)
   --hidden-dim N            (default: $HIDDEN_DIM)
   --num-layers N            (default: $NUM_LAYERS)
@@ -71,7 +71,7 @@ Other:
   -h|--help
 
 Example:
-  $0 --dataset imdb --max-len 64 --hidden-dim 128 --num-layers 3 --epochs 1
+  $0 --dataset imdb --max-len 64 --hidden-dim 128 --num-layers 3 --epochs 3
 EOF
 }
 
@@ -80,7 +80,6 @@ SKIP_BUILD=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dataset) DATASET="$2"; shift 2;;
-    --tokenizer) TOKENIZER="$2"; shift 2;;
     --max-len) MAX_LEN="$2"; shift 2;;
     --hidden-dim) HIDDEN_DIM="$2"; shift 2;;
     --num-layers) NUM_LAYERS="$2"; shift 2;;
@@ -114,7 +113,6 @@ echo "[1/4] Python train+export -> $OUT_DIR"
 TRAIN_LOG="$OUT_DIR/train_export.log"
 python3 "$ROOT_DIR/embedding/python/train_export_emb.py" \
   --dataset "$DATASET" \
-  --tokenizer "$TOKENIZER" \
   --max-len "$MAX_LEN" \
   --hidden-dim "$HIDDEN_DIM" \
   --num-layers "$NUM_LAYERS" \
