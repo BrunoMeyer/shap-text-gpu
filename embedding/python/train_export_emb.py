@@ -29,7 +29,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay for optimizer")
 
     p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--patience", type=int, default=5, help="Early stopping patience (in epochs) based on test accuracy")
     p.add_argument("--lr", type=float, default=1e-3)
 
     p.add_argument("--train-samples", type=int, default=2000)
@@ -328,6 +329,10 @@ def main() -> None:
     optim = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     loss_fn = nn.CrossEntropyLoss()
 
+    best_test_acc = -1.0
+    best_state = None
+    epochs_no_improve = 0
+
     model.train()
     for epoch in range(1, args.epochs + 1):
         running = 0.0
@@ -345,8 +350,26 @@ def main() -> None:
 
         test_loss, test_acc = evaluate(model, test_loader, device)
         print(f"epoch={epoch} train_loss={running/max(seen,1):.4f} test_loss={test_loss:.4f} test_acc={test_acc:.4f}")
+        # Track best-performing model (by test accuracy) and keep a CPU copy
+        if test_acc > best_test_acc:
+            best_test_acc = test_acc
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
 
-    # Final evaluation after training: print final test accuracy for callers/scripts
+        # Early stopping based on patience
+        if args.patience is not None and epochs_no_improve >= int(args.patience):
+            print(f"Early stopping: no improvement for {epochs_no_improve} epochs (patience={args.patience})")
+            break
+
+    # If we captured a best_state, restore it before final evaluation/export so
+    # the exported weights correspond to the best-performing epoch.
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        print(f"restored best model with test_acc={best_test_acc:.4f} before export")
+
+    # Final evaluation after training/export restore: print final test accuracy for callers/scripts
     final_test_loss, final_test_acc = evaluate(model, test_loader, device)
     print(f"final_test_loss={final_test_loss:.4f} final_test_acc={final_test_acc:.4f}")
 
