@@ -345,6 +345,13 @@ int main(int argc, char** argv) {
         else if (a == "--threads" && i + 1 < argc) threads = std::stoi(argv[++i]);
         else if (a == "--print" && i + 1 < argc) max_print = std::stoi(argv[++i]);
         else if (a == "--sample" && i + 1 < argc) sample = std::stoi(argv[++i]);
+        else if ((a == "--npermutations" || a == "--n-permutations") && i + 1 < argc) {
+            // allow both --npermutations (script) and --n-permutations (other callers)
+            // store into argv for later re-parse as well
+            // we'll set n_permutations later after loading files
+            // temporarily consume it so initial parsing doesn't treat it as unknown
+            i += 1; // skip value here
+        }
         else {
             std::cerr << "Unknown/invalid arg: " << a << "\n";
             return 2;
@@ -366,7 +373,7 @@ int main(int argc, char** argv) {
         // Re-parse argv to pick up --n-permutations if present
         for (int i = 1; i < argc; i++) {
             std::string a = argv[i];
-            if (a == "--n-permutations" && i + 1 < argc) {
+            if ((a == "--n-permutations" || a == "--npermutations") && i + 1 < argc) {
                 n_permutations = std::stoi(argv[++i]);
             }
         }
