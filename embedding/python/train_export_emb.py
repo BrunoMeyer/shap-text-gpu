@@ -379,6 +379,27 @@ def main() -> None:
     export_vocab_text(vocab, os.path.join(args.out_dir, 'vocab.txt'))
     export_dataset_text(test_ids, test_y, dataset_path)
 
+    # Compute logits for the test set and save sorted by descending first-logit score
+    model.eval()
+    with torch.no_grad():
+        device_test_ids = test_ids.to(device)
+        logits_all = model(device_test_ids)
+        # take the first logit (consistent with emb_shap.cu which reads in_vec[0])
+        if logits_all.dim() == 1:
+            scores = logits_all.cpu().tolist()
+        else:
+            scores = logits_all[:, 0].cpu().tolist()
+
+    # Pair sample index with score and sort descending
+    paired = list(enumerate(scores))
+    paired.sort(key=lambda x: x[1], reverse=True)
+    logits_out_path = os.path.join(args.out_dir, 'test_logits_sorted.csv')
+    with open(logits_out_path, 'w', encoding='utf-8') as lf:
+        lf.write('sample_idx,logit\n')
+        for idx, sc in paired:
+            lf.write(f"{idx},{sc:.9g}\n")
+    print(f"wrote: {logits_out_path}")
+
     meta = {
         "dataset": args.dataset,
         "vocab_size": vocab_size,

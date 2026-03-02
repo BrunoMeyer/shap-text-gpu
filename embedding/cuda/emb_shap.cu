@@ -268,6 +268,67 @@ __global__ void emb_mlp_forward_kernel(
     __syncthreads();
 }
 
+// Kernel: compute logits for the sample without any permutation (mean-pooled embedding)
+__global__ void compute_logits_no_perm_kernel(
+    const int32_t* token_ids, // [seq_len] for selected sample
+    int seq_len,
+    const float* embedding_matrix,
+    int embed_dim,
+    const float* W_all,
+    const float* b_all,
+    const int* w_offsets,
+    const int* b_offsets,
+    const int* in_dims,
+    const int* out_dims,
+    int num_layers,
+    float* logits_out, // [out_dim_last]
+    int out_dim_last,
+    int max_dim
+) {
+    int tx = threadIdx.x;
+    int stride = blockDim.x;
+
+    extern __shared__ char s[];
+    float* buf0 = reinterpret_cast<float*>(s);
+    float* buf1 = reinterpret_cast<float*>(s + (size_t)max_dim * sizeof(float));
+    // reuse running_sum area (placed after buf0/buf1) sized at embed_dim
+    float* running_sum = reinterpret_cast<float*>(s + (size_t)max_dim * 2 * sizeof(float) + (size_t)seq_len * sizeof(int) + (size_t)seq_len * sizeof(float));
+
+    // zero running sum
+    for (int d = tx; d < embed_dim; d += stride) running_sum[d] = 0.0f;
+    __syncthreads();
+
+    // accumulate embeddings for all tokens
+    for (int t = 0; t < seq_len; ++t) {
+        int32_t tok = token_ids[t];
+        const float* emb_row = embedding_matrix + (size_t)tok * (size_t)embed_dim;
+        for (int d = tx; d < embed_dim; d += stride) {
+            running_sum[d] += emb_row[d];
+        }
+    }
+    __syncthreads();
+
+    // compute mean into buf0
+    float denom = 1.0f / (float)seq_len;
+    for (int d = tx; d < embed_dim; d += stride) buf0[d] = running_sum[d] * denom;
+    __syncthreads();
+
+    // run MLP
+    float* final_buf = mlp_compute_layers_device(buf0, buf1,
+                                                 W_all, b_all,
+                                                 w_offsets, b_offsets,
+                                                 in_dims, out_dims,
+                                                 num_layers,
+                                                 tx, stride, 0);
+    __syncthreads();
+
+    // write full logits
+    for (int o = tx; o < out_dim_last; o += stride) {
+        logits_out[o] = final_buf[o];
+    }
+    __syncthreads();
+}
+
 int main(int argc, char** argv) {
     std::string weights_path = "out/mlp_weights.txt";
     std::string dataset_path = "out/tokenized_dataset.txt";
@@ -357,6 +418,8 @@ int main(int argc, char** argv) {
         checkCuda(cudaMalloc(&d_in_dims, in_dims.size() * sizeof(int)), "cudaMalloc in_dims");
         checkCuda(cudaMalloc(&d_out_dims, out_dims.size() * sizeof(int)), "cudaMalloc out_dims");
         checkCuda(cudaMalloc(&d_logits, (size_t)2 * (size_t)n_permutations * sizeof(float)), "cudaMalloc logits");
+        float* d_logits_cpu = nullptr;
+        checkCuda(cudaMalloc(&d_logits_cpu, (size_t)out_dim_last * sizeof(float)), "cudaMalloc logits_cpu");
 
         checkCuda(cudaMemcpy(d_token_ids, ds.token_ids.data() + (size_t)sample * (size_t)ds.seq_len,
                      sample_tokens * sizeof(int32_t), cudaMemcpyHostToDevice), "memcpy token_ids");
@@ -378,6 +441,34 @@ int main(int argc, char** argv) {
 
         dim3 grid((unsigned int)2 * (unsigned int)n_permutations);
         dim3 block(threads);
+
+        // Compute logits for the selected sample without permutation (GPU)
+        size_t shmem_cpu = (size_t)max_dim * 2 * sizeof(float) + (size_t)ds.seq_len * sizeof(int) + (size_t)ds.seq_len * sizeof(float) + (size_t)emb.embed_dim * sizeof(float);
+        compute_logits_no_perm_kernel<<<1, block, shmem_cpu>>>(
+            d_token_ids,
+            ds.seq_len,
+            d_embedding,
+            emb.embed_dim,
+            d_W,
+            d_b,
+            d_w_offsets,
+            d_b_offsets,
+            d_in_dims,
+            d_out_dims,
+            num_layers,
+            d_logits_cpu,
+            out_dim_last,
+            max_dim
+        );
+        checkCuda(cudaGetLastError(), "compute_logits_no_perm kernel launch");
+        checkCuda(cudaDeviceSynchronize(), "device sync compute_logits_no_perm");
+
+        std::vector<float> h_logits_cpu((size_t)out_dim_last);
+        checkCuda(cudaMemcpy(h_logits_cpu.data(), d_logits_cpu, h_logits_cpu.size() * sizeof(float), cudaMemcpyDeviceToHost), "memcpy logits_cpu back");
+        std::cout << "device_no_perm_logits: ";
+        for (int i = 0; i < out_dim_last; ++i) {
+            std::cout << h_logits_cpu[(size_t)i] << (i + 1 < out_dim_last ? " " : "\n");
+        }
 
         // Allocate and zero device shap buffer (one aggregated vector of length seq_len)
         float* d_shap = nullptr;
@@ -489,6 +580,7 @@ int main(int argc, char** argv) {
         cudaFree(d_in_dims);
         cudaFree(d_out_dims);
         cudaFree(d_logits);
+        cudaFree(d_logits_cpu);
         cudaFree(d_shap);
 
     } catch (const std::exception& e) {
