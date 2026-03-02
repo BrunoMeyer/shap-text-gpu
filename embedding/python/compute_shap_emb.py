@@ -314,22 +314,39 @@ def main():
         else:
             raise ValueError("Unsupported explainer")
 
-    # Detokenize for context and write output
-    try:
-        from transformers import AutoTokenizer
-    except Exception:
-        raise RuntimeError("transformers is required to detokenize tokens. Install via 'pip install transformers'")
+    # Detokenize using the exported `vocab.txt` (matches `train_export_emb` tokenization)
+    # Try to locate vocab file from meta export or next to the dataset
+    vocab_path = None
+    emb_export = meta.get("export", {})
+    if emb_export:
+        # try common name
+        possible = emb_export.get("vocab_file")
+        if possible:
+            vocab_path = os.path.join(os.path.dirname(args.dataset), possible)
+    if vocab_path is None:
+        # fallback to dataset directory / vocab.txt
+        vocab_path = os.path.join(os.path.dirname(args.dataset), "vocab.txt")
 
-    tok = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
-    tokens = tok.convert_ids_to_tokens(token_ids)
-    text = tok.decode(token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+    if not os.path.exists(vocab_path):
+        raise FileNotFoundError(f"Vocab file not found for detokenization: {vocab_path}")
+
+    # load vocab list: line index == token id
+    vocab_list = []
+    with open(vocab_path, "r", encoding="utf-8") as vf:
+        for line in vf:
+            vocab_list.append(line.rstrip("\n"))
+
+    # Map token ids to strings
+    tokens = [vocab_list[tid] if 0 <= tid < len(vocab_list) else "<unk>" for tid in token_ids]
+    # Reconstruct a simple detokenized text by joining tokens with spaces
+    text = " ".join(tokens).strip()
 
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(f"sample={args.sample} explainer={args.explainer} target={target} sample_size={sample_size}\n")
         f.write(f"detokenized_full_text: {text}\n")
         f.write("idx\ttoken_id\ttoken_str\tshap_value\n")
         for i, tid in enumerate(token_ids):
-            tok_str = tok.convert_tokens_to_string([tokens[i]])
+            tok_str = tokens[i]
             sv = float(shap_vals[i]) if i < len(shap_vals) else 0.0
             f.write(f"{i}\t{tid}\t{tok_str}\t{sv}\n")
 
