@@ -147,7 +147,7 @@ echo "Running emb_shap on exported dataset (this may take time). Output -> $OUT_
 "$EMB_BIN" \
   --weights "$OUT_DIR/$WEIGHTS_FILE" \
   --dataset "$OUT_DIR/$DATASET_FILE" \
-  --npermutations "$N_PERMUTATIONS" \
+  --n-permutations "$N_PERMUTATIONS" \
   --embeddings "$OUT_DIR/embedding_matrix.txt" \
   --threads "$THREADS" \
   --sample "$SAMPLE_ID" \
