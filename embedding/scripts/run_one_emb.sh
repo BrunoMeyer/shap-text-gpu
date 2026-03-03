@@ -164,7 +164,6 @@ fi
 
 # Run Python SHAP computation (permutation + linear) using the exported files
 PERM_OUT="$OUT_DIR/${DATASET_FILE}.sample${SAMPLE_ID}.compute_shap.permutation.txt"
-LINEAR_OUT="$OUT_DIR/${DATASET_FILE}.sample${SAMPLE_ID}.compute_shap.linear.txt"
 echo "[3.1] Compute SHAP (permutation) -> $PERM_OUT"
 python3 "$ROOT_DIR/embedding/python/compute_shap_emb.py" \
   --weights "$OUT_DIR/$WEIGHTS_FILE" \
@@ -176,16 +175,6 @@ python3 "$ROOT_DIR/embedding/python/compute_shap_emb.py" \
   --npermutations "$N_PERMUTATIONS" \
   --out "$PERM_OUT" 2>&1 | tee "$OUT_DIR/compute_shap_permutation.log" || true
 
-echo "[3.2] Compute SHAP (linear) -> $LINEAR_OUT"
-python3 "$ROOT_DIR/embedding/python/compute_shap_emb.py" \
-  --weights "$OUT_DIR/$WEIGHTS_FILE" \
-  --dataset "$OUT_DIR/$DATASET_FILE" \
-  --meta "$OUT_DIR/$META_FILE" \
-  --embeddings "$OUT_DIR/embedding_matrix.txt" \
-  --sample "$SAMPLE_ID" \
-  --explainer linear \
-  --out "$LINEAR_OUT" 2>&1 | tee "$OUT_DIR/compute_shap_linear.log" || true
-
 echo "[4/4] Detokenize SHAP for sample $SAMPLE_ID -> $OUT_DIR/sample${SAMPLE_ID}_shap.txt"
 python3 "$ROOT_DIR/embedding/python/detokenize_shap_emb.py" \
   --dataset "$OUT_DIR/$DATASET_FILE" \
@@ -196,39 +185,48 @@ python3 "$ROOT_DIR/embedding/python/detokenize_shap_emb.py" \
 
 # Also make the compute_shap_emb outputs easy to find (they already include detokenized tokens)
 PERM_OUT="$OUT_DIR/${DATASET_FILE}.sample${SAMPLE_ID}.compute_shap.permutation.txt"
-LINEAR_OUT="$OUT_DIR/${DATASET_FILE}.sample${SAMPLE_ID}.compute_shap.linear.txt"
 if [[ -f "$PERM_OUT" ]]; then
   cp "$PERM_OUT" "$OUT_DIR/sample${SAMPLE_ID}_shap.permutation.txt"
   echo "copied permutation SHAP detokenized output to $OUT_DIR/sample${SAMPLE_ID}_shap.permutation.txt"
 fi
-if [[ -f "$LINEAR_OUT" ]]; then
-  cp "$LINEAR_OUT" "$OUT_DIR/sample${SAMPLE_ID}_shap.linear.txt"
-  echo "copied linear SHAP detokenized output to $OUT_DIR/sample${SAMPLE_ID}_shap.linear.txt"
-fi
 
-# Collect SHAP timing information (CUDA and Python explainers) and save to CSV
+# Collect SHAP timing information (CUDA and Python explainers) and save one CSV row per sample
 TIMES_FILE="$OUT_DIR/shap_times.csv"
 if [[ ! -f "$TIMES_FILE" ]]; then
-  echo "sample,explainer,time_s" > "$TIMES_FILE"
+  echo "sample,cuda_time,permutation_time" > "$TIMES_FILE"
 fi
 
 # CUDA kernel time (ms -> s)
 cuda_ms=$(grep -o 'cuda_kernel_time_ms=[0-9.]*' "$OUT_DIR/shap_values.txt" | tail -n1 | cut -d= -f2 || true)
 if [[ -n "$cuda_ms" ]]; then
   cuda_s=$(awk "BEGIN{printf \"%.6f\", $cuda_ms/1000}")
-  echo "${SAMPLE_ID},cuda,${cuda_s}" >> "$TIMES_FILE"
+else
+  cuda_s=""
 fi
 
 # Python permutation explainer time (seconds)
 perm_s=$(grep -o 'permutation_explainer_eval_time=[0-9.]*s' "$OUT_DIR/compute_shap_permutation.log" 2>/dev/null | tail -n1 | sed 's/.*=//' | sed 's/s$//' || true)
-if [[ -n "$perm_s" ]]; then
-  echo "${SAMPLE_ID},permutation,${perm_s}" >> "$TIMES_FILE"
+if [[ -z "$perm_s" ]]; then
+  perm_s=""
 fi
 
-# Python linear explainer time (seconds)
-lin_s=$(grep -o 'linear_explainer_eval_time=[0-9.]*s' "$OUT_DIR/compute_shap_linear.log" 2>/dev/null | tail -n1 | sed 's/.*=//' | sed 's/s$//' || true)
-if [[ -n "$lin_s" ]]; then
-  echo "${SAMPLE_ID},linear,${lin_s}" >> "$TIMES_FILE"
-fi
-
+echo "${SAMPLE_ID},${cuda_s},${perm_s}" >> "$TIMES_FILE"
 echo "Saved SHAP timing(s) to: $TIMES_FILE"
+
+# Generate detailed summaries (top/bottom tokens) for CUDA and permutation explainers
+GEN_SCRIPT="$ROOT_DIR/embedding/scripts/generate_shap_summaries.py"
+if [[ -f "$GEN_SCRIPT" ]]; then
+  echo "Generating detailed SHAP summaries (CUDA + permutation)"
+  python3 "$GEN_SCRIPT" \
+    --out-dir "$OUT_DIR" \
+    --sample "$SAMPLE_ID" \
+    --vocab "$OUT_DIR/vocab.txt" \
+    --cuda-shap-csv "$OUT_DIR/${DATASET_FILE}.shap_values.csv" \
+    --cuda-log "$OUT_DIR/shap_values.txt" \
+    --perm-detok "$OUT_DIR/sample${SAMPLE_ID}_shap.permutation.txt" \
+    --perm-log "$OUT_DIR/compute_shap_permutation.log" \
+    --logits-file "$OUT_DIR/test_logits_sorted.csv" || true
+  echo "Wrote summaries: $OUT_DIR/cuda_shap_summary.csv and $OUT_DIR/permutation_shap_summary.csv"
+else
+  echo "Summary generator not found: $GEN_SCRIPT" >&2
+fi
