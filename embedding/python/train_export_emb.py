@@ -387,17 +387,27 @@ def main() -> None:
         # take the first logit (consistent with emb_shap.cu which reads in_vec[0])
         if logits_all.dim() == 1:
             scores = logits_all.cpu().tolist()
+            preds = [0] * len(scores)
         else:
             scores = logits_all[:, 0].cpu().tolist()
+            preds = logits_all.argmax(dim=-1).cpu().tolist()
 
-    # Pair sample index with score and sort descending
-    paired = list(enumerate(scores))
+    # true labels for test set
+    true_labels = test_y.cpu().tolist()
+
+    # Pair sample index with score, true class and predicted class; sort descending by score
+    paired = []
+    for idx, sc in enumerate(scores):
+        t = int(true_labels[idx]) if idx < len(true_labels) else 0
+        p = int(preds[idx]) if idx < len(preds) else 0
+        paired.append((idx, sc, t, p))
     paired.sort(key=lambda x: x[1], reverse=True)
+
     logits_out_path = os.path.join(args.out_dir, 'test_logits_sorted.csv')
     with open(logits_out_path, 'w', encoding='utf-8') as lf:
-        lf.write('sample_idx,logit\n')
-        for idx, sc in paired:
-            lf.write(f"{idx},{sc:.9g}\n")
+        lf.write('sample_idx,logit,true_class,pred_class\n')
+        for idx, sc, t, p in paired:
+            lf.write(f"{idx},{sc:.9g},{t},{p}\n")
     print(f"wrote: {logits_out_path}")
 
     meta = {
