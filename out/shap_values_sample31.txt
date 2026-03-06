@@ -1,0 +1,15 @@
+device_no_perm_logits: -3.53452 3.34227
+cuda_kernel_time_ms=19.6854
+block=0 logit=-0.00780082
+block=1 logit=-0.00799561
+block=2 logit=-0.0378366
+block=3 logit=0.0832698
+block=4 logit=-0.00343204
+block=5 logit=-0.0296662
+block=6 logit=0.0188668
+block=7 logit=-0.00373411
+block=8 logit=0.12061
+block=9 logit=-0.00819993
+shap_values[0..9] = 0.229702, -0.679675, -0.215114, -0.205917, 0.106423, 0.533741, -0.521019, 0.263139, -0.263391, -0.104613
+wrote shap values to /home/margotte/shap-text-gpu/out/tokenized_dataset.txt.shap_values.csv
+cpu_check sample=0 score=-8.77678
