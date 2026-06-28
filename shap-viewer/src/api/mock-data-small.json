@@ -1,0 +1,18 @@
+[
+  {
+    "file_name": "sample1.txt",
+    "metadata": {
+      "sample": 0,
+      "explainer": "permutation",
+      "target": 0,
+      "sample_size": 128
+    },
+    "detokenized_full_text": "whatever you do , don ' t stop watching ...",
+    "tokens": [
+      { "idx": 0, "token_id": 1009, "token_str": "whatever", "shap_value": 0.35 }
+    ],
+    "shap_gpu_tokens": [
+      { "idx": 0, "token_id": 1009, "token_str": "whatever", "shap_value": 0.12 }
+    ]
+  }
+]
